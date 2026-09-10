@@ -6,6 +6,7 @@
 void BSP_Board_Init(void);
 void BSP_Log(const char *text);
 void BSP_LED_Set(uint8_t led, uint8_t on);
+void BSP_Buzzer_Set(uint8_t on);
 void BSP_Buzzer_Beep(uint32_t milliseconds);
 uint8_t BSP_Key_Read(void);
 uint16_t BSP_ADC_Average(void);
@@ -59,5 +60,26 @@ uint8_t BSP_Audio_InitAndStartTone(void);
 void BSP_Audio_Stop(void);
 uint8_t BSP_LCD_InitAndShow(void);
 uint8_t BSP_SD_MountAndProbe(void);
+
+/* The two user alarms are backed by the STM32 RTC Alarm A and Alarm B
+   hardware.  `enabled` controls the normal once-per-day schedule. */
+typedef struct
+{
+  uint8_t hours;
+  uint8_t minutes;
+  uint8_t seconds;
+  uint8_t enabled;
+} BspAlarmConfig;
+
+#define BSP_ALARM_A 0U
+#define BSP_ALARM_B 1U
+
+void BSP_Alarm_Init(void);
+void BSP_Alarm_Get(uint8_t alarm_id, BspAlarmConfig *config);
+uint8_t BSP_Alarm_Set(uint8_t alarm_id, const BspAlarmConfig *config);
+uint8_t BSP_Alarm_TakePending(uint8_t *alarm_id);
+void BSP_Alarm_Snooze(uint8_t alarm_id);
+void BSP_Alarm_Dismiss(uint8_t alarm_id);
+void BSP_Alarm_Timeout(uint8_t alarm_id);
 
 #endif

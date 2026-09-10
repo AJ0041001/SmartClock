@@ -13,6 +13,7 @@ extern I2S_HandleTypeDef hi2s2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
+extern RTC_HandleTypeDef hrtc;
 
 #define BSP_ADC_CAPTURE_SAMPLE_COUNT 4096U
 #define BSP_ADC_CAPTURE_MASK         (BSP_ADC_CAPTURE_SAMPLE_COUNT - 1U)
@@ -36,6 +37,15 @@ static uint32_t adc_frequency_history[4];
 static uint32_t adc_frequency_sum;
 static uint8_t adc_frequency_count;
 static uint8_t adc_frequency_index;
+
+/* Alarm configuration deliberately lives outside CubeMX-generated files.
+   CubeMX can be regenerated without replacing this user-facing behaviour. */
+static BspAlarmConfig bsp_alarm_config[2] = {
+  {7U, 0U, 0U, 0U},
+  {7U, 30U, 0U, 0U}
+};
+static volatile uint8_t bsp_alarm_pending_mask;
+static uint8_t bsp_alarm_snoozed[2];
 
 #define BSP_DAC_SAMPLE_COUNT 128U
 #define BSP_DAC_VREF_X10     33U
@@ -147,11 +157,209 @@ void BSP_LED_Set(uint8_t led, uint8_t on)
   HAL_GPIO_WritePin(port, pin, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
+void BSP_Buzzer_Set(uint8_t on)
+{
+  HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin,
+                    (on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
 void BSP_Buzzer_Beep(uint32_t milliseconds)
 {
-  HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_SET);
+  BSP_Buzzer_Set(1U);
   HAL_Delay(milliseconds);
-  HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+  BSP_Buzzer_Set(0U);
+}
+
+static uint8_t bsp_alarm_is_valid(uint8_t alarm_id)
+{
+  return (uint8_t)(alarm_id <= BSP_ALARM_B);
+}
+
+static uint8_t bsp_alarm_days_in_month(uint8_t year, uint8_t month)
+{
+  static const uint8_t days[] =
+      {31U, 28U, 31U, 30U, 31U, 30U, 31U, 31U, 30U, 31U, 30U, 31U};
+  uint16_t full_year = (uint16_t)year + 2000U;
+
+  if (month == 2U && ((full_year % 4U) == 0U)) return 29U;
+  if (month < 1U || month > 12U) return 31U;
+  return days[month - 1U];
+}
+
+static uint32_t bsp_alarm_hal_id(uint8_t alarm_id)
+{
+  return (alarm_id == BSP_ALARM_A) ? RTC_ALARM_A : RTC_ALARM_B;
+}
+
+static void bsp_alarm_deactivate(uint8_t alarm_id)
+{
+  (void)HAL_RTC_DeactivateAlarm(&hrtc, bsp_alarm_hal_id(alarm_id));
+}
+
+static uint8_t bsp_alarm_program_daily(uint8_t alarm_id)
+{
+  RTC_AlarmTypeDef alarm = {0};
+  const BspAlarmConfig *config;
+
+  if (bsp_alarm_is_valid(alarm_id) == 0U) return 0U;
+  config = &bsp_alarm_config[alarm_id];
+  bsp_alarm_deactivate(alarm_id);
+  if (config->enabled == 0U) return 1U;
+
+  alarm.AlarmTime.Hours = config->hours;
+  alarm.AlarmTime.Minutes = config->minutes;
+  alarm.AlarmTime.Seconds = config->seconds;
+  alarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  alarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  /* Masking the date makes the alarm recur every day at the configured time. */
+  alarm.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+  alarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+  alarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+  alarm.AlarmDateWeekDay = 1U;
+  alarm.Alarm = bsp_alarm_hal_id(alarm_id);
+
+  return (HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN) == HAL_OK) ? 1U : 0U;
+}
+
+static uint8_t bsp_alarm_program_snooze(uint8_t alarm_id)
+{
+  RTC_TimeTypeDef time = {0};
+  RTC_DateTypeDef date = {0};
+  RTC_AlarmTypeDef alarm = {0};
+
+  if (bsp_alarm_is_valid(alarm_id) == 0U) return 0U;
+  (void)HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN);
+  (void)HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+
+  time.Minutes = (uint8_t)(time.Minutes + 5U);
+  if (time.Minutes >= 60U)
+  {
+    time.Minutes = (uint8_t)(time.Minutes - 60U);
+    time.Hours++;
+    if (time.Hours >= 24U)
+    {
+      time.Hours = 0U;
+      date.Date++;
+      if (date.Date > bsp_alarm_days_in_month(date.Year, date.Month))
+      {
+        date.Date = 1U;
+        date.Month++;
+        if (date.Month > 12U)
+        {
+          date.Month = 1U;
+          date.Year = (uint8_t)((date.Year + 1U) % 100U);
+        }
+      }
+    }
+  }
+
+  bsp_alarm_deactivate(alarm_id);
+  alarm.AlarmTime.Hours = time.Hours;
+  alarm.AlarmTime.Minutes = time.Minutes;
+  alarm.AlarmTime.Seconds = time.Seconds;
+  alarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  alarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  /* Date is intentionally not masked: a snooze is a one-shot alarm. */
+  alarm.AlarmMask = RTC_ALARMMASK_NONE;
+  alarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_ALL;
+  alarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
+  alarm.AlarmDateWeekDay = date.Date;
+  alarm.Alarm = bsp_alarm_hal_id(alarm_id);
+
+  return (HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN) == HAL_OK) ? 1U : 0U;
+}
+
+void BSP_Alarm_Init(void)
+{
+  /* CubeMX emits two demonstration alarms.  Both must be removed before
+     user configuration is applied; otherwise a hidden 00:00 alarm exists. */
+  bsp_alarm_pending_mask = 0U;
+  for (uint8_t i = BSP_ALARM_A; i <= BSP_ALARM_B; i++)
+  {
+    bsp_alarm_snoozed[i] = 0U;
+    (void)bsp_alarm_program_daily(i);
+  }
+}
+
+void BSP_Alarm_Get(uint8_t alarm_id, BspAlarmConfig *config)
+{
+  if (config == NULL || bsp_alarm_is_valid(alarm_id) == 0U) return;
+  *config = bsp_alarm_config[alarm_id];
+}
+
+uint8_t BSP_Alarm_Set(uint8_t alarm_id, const BspAlarmConfig *config)
+{
+  BspAlarmConfig safe_config;
+
+  if (config == NULL || bsp_alarm_is_valid(alarm_id) == 0U) return 0U;
+  safe_config = *config;
+  if (safe_config.hours > 23U) safe_config.hours = 23U;
+  if (safe_config.minutes > 59U) safe_config.minutes = 59U;
+  if (safe_config.seconds > 59U) safe_config.seconds = 59U;
+  safe_config.enabled = (safe_config.enabled != 0U) ? 1U : 0U;
+  bsp_alarm_config[alarm_id] = safe_config;
+  bsp_alarm_snoozed[alarm_id] = 0U;
+  return bsp_alarm_program_daily(alarm_id);
+}
+
+uint8_t BSP_Alarm_TakePending(uint8_t *alarm_id)
+{
+  uint8_t pending = bsp_alarm_pending_mask;
+
+  if ((pending & 0x01U) != 0U)
+  {
+    bsp_alarm_pending_mask = (uint8_t)(pending & (uint8_t)~0x01U);
+    if (alarm_id != NULL) *alarm_id = BSP_ALARM_A;
+    return 1U;
+  }
+  if ((pending & 0x02U) != 0U)
+  {
+    bsp_alarm_pending_mask = (uint8_t)(pending & (uint8_t)~0x02U);
+    if (alarm_id != NULL) *alarm_id = BSP_ALARM_B;
+    return 1U;
+  }
+  return 0U;
+}
+
+void BSP_Alarm_Snooze(uint8_t alarm_id)
+{
+  if (bsp_alarm_is_valid(alarm_id) == 0U) return;
+  if (bsp_alarm_program_snooze(alarm_id) != 0U) bsp_alarm_snoozed[alarm_id] = 1U;
+}
+
+void BSP_Alarm_Dismiss(uint8_t alarm_id)
+{
+  if (bsp_alarm_is_valid(alarm_id) == 0U) return;
+  bsp_alarm_snoozed[alarm_id] = 0U;
+  (void)bsp_alarm_program_daily(alarm_id);
+}
+
+void BSP_Alarm_Timeout(uint8_t alarm_id)
+{
+  if (bsp_alarm_is_valid(alarm_id) == 0U) return;
+
+  /* First unanswered alarm snoozes.  If that snoozed alarm is ignored too,
+     disable it completely as requested instead of ringing indefinitely. */
+  if (bsp_alarm_snoozed[alarm_id] == 0U)
+  {
+    BSP_Alarm_Snooze(alarm_id);
+  }
+  else
+  {
+    bsp_alarm_config[alarm_id].enabled = 0U;
+    bsp_alarm_snoozed[alarm_id] = 0U;
+    bsp_alarm_deactivate(alarm_id);
+  }
+}
+
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *rtc)
+{
+  if (rtc == &hrtc) bsp_alarm_pending_mask |= 0x01U;
+}
+
+void HAL_RTCEx_AlarmBEventCallback(RTC_HandleTypeDef *rtc)
+{
+  if (rtc == &hrtc) bsp_alarm_pending_mask |= 0x02U;
 }
 
 uint8_t BSP_Key_Read(void)
@@ -797,7 +1005,8 @@ void BSP_Board_Init(void)
   delay_init();
   BSP_LED_Set(0U, 0U);
   BSP_LED_Set(1U, 0U);
-  HAL_GPIO_WritePin(BEEP_GPIO_Port, BEEP_Pin, GPIO_PIN_RESET);
+  BSP_Buzzer_Set(0U);
+  BSP_Alarm_Init();
   BSP_Touch_Init();
 //  BSP_DAC_StartTestWave();
   (void)HAL_TIM_Base_Start(&htim3);
