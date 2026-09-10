@@ -14,11 +14,28 @@ extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
 
-static uint16_t adc_samples[128];
+#define BSP_ADC_CAPTURE_SAMPLE_COUNT 4096U
+#define BSP_ADC_CAPTURE_MASK         (BSP_ADC_CAPTURE_SAMPLE_COUNT - 1U)
+#define BSP_ADC_MIN_SPAN_CODES       40U
+#define BSP_ADC_FAST_SAMPLE_RATE_HZ  80000U
+#define BSP_ADC_MID_SAMPLE_RATE_HZ   20000U
+#define BSP_ADC_LOW_SAMPLE_RATE_HZ   1600U
+#define BSP_ADC_MID_ENTER_HZ_X10     1500U
+#define BSP_ADC_FAST_RETURN_HZ_X10   2500U
+#define BSP_ADC_LOW_ENTER_HZ_X10     200U
+#define BSP_ADC_MID_RETURN_HZ_X10    250U
+#define BSP_ADC_LOW_TIMEBASE_HZ_X10  500U
+
+static volatile uint16_t adc_samples[BSP_ADC_CAPTURE_SAMPLE_COUNT];
 static uint16_t dac_samples[128];
 static uint16_t audio_samples[128];
 static uint8_t adc_started;
 static uint8_t audio_started;
+static uint32_t adc_start_tick;
+static uint32_t adc_frequency_history[4];
+static uint32_t adc_frequency_sum;
+static uint8_t adc_frequency_count;
+static uint8_t adc_frequency_index;
 
 #define BSP_DAC_SAMPLE_COUNT 128U
 #define BSP_DAC_VREF_X10     33U
@@ -146,15 +163,534 @@ uint8_t BSP_Key_Read(void)
   return 0U;
 }
 
+static uint8_t bsp_adc_start_if_needed(void)
+{
+  if (adc_started != 0U) return 1U;
+
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_samples,
+                        BSP_ADC_CAPTURE_SAMPLE_COUNT) != HAL_OK)
+    return 0U;
+
+  adc_started = 1U;
+  adc_start_tick = HAL_GetTick();
+  return 1U;
+}
+
+static uint32_t bsp_adc_sample_rate_hz(void)
+{
+  /* TIM3 and TIM6 both belong to APB1.  Read the actual TIM3 dividers so
+     this remains correct if CubeMX later changes the sampling timer setup. */
+  uint32_t timer_clock = bsp_dac_timer_clock();
+  uint32_t prescaler = (uint32_t)htim3.Instance->PSC + 1U;
+  uint32_t period = (uint32_t)htim3.Instance->ARR + 1U;
+
+  return timer_clock / prescaler / period;
+}
+
+static uint32_t bsp_adc_filter_frequency(uint32_t raw_frequency_x10);
+
+/* Low frequencies need a longer time window; high frequencies need more
+   points per period.  TIM3 is changed only at runtime and all measurement
+   code reads its actual register values, so CubeMX can keep its 80 kHz
+   startup configuration. */
+static void bsp_adc_set_sample_rate(uint32_t target_rate_hz)
+{
+  uint32_t timer_clock;
+  uint32_t period_ticks;
+
+  if (bsp_adc_sample_rate_hz() == target_rate_hz) return;
+
+  timer_clock = bsp_dac_timer_clock();
+  period_ticks = (timer_clock + target_rate_hz / 2U) / target_rate_hz;
+  if (period_ticks < 1U) period_ticks = 1U;
+  if (period_ticks > 65536U) period_ticks = 65536U;
+
+  (void)HAL_TIM_Base_Stop(&htim3);
+  __HAL_TIM_SET_PRESCALER(&htim3, 0U);
+  __HAL_TIM_SET_AUTORELOAD(&htim3, period_ticks - 1U);
+  __HAL_TIM_SET_COUNTER(&htim3, 0U);
+  htim3.Instance->EGR = TIM_EGR_UG;
+  (void)HAL_TIM_Base_Start(&htim3);
+
+  /* Let one entire DMA ring be replaced at the new rate before analysing it. */
+  adc_start_tick = HAL_GetTick();
+  (void)bsp_adc_filter_frequency(0U);
+}
+
+static uint16_t bsp_adc_ring_sample(uint16_t start_index, uint16_t offset)
+{
+  return adc_samples[(start_index + offset) & BSP_ADC_CAPTURE_MASK];
+}
+
+/* The raw period estimate is quantized to ADC sample positions.  A four-frame
+   average makes the reported value stable while keeping a genuine, large
+   frequency change responsive by resetting the short history. */
+static uint32_t bsp_adc_filter_frequency(uint32_t raw_frequency_x10)
+{
+  uint32_t average;
+  uint32_t difference;
+
+  if (raw_frequency_x10 == 0U)
+  {
+    adc_frequency_sum = 0U;
+    adc_frequency_count = 0U;
+    adc_frequency_index = 0U;
+    return 0U;
+  }
+
+  if (adc_frequency_count != 0U)
+  {
+    average = adc_frequency_sum / adc_frequency_count;
+    difference = (raw_frequency_x10 >= average) ?
+                 (raw_frequency_x10 - average) : (average - raw_frequency_x10);
+    if (difference * 5U > average)
+    {
+      adc_frequency_sum = 0U;
+      adc_frequency_count = 0U;
+      adc_frequency_index = 0U;
+    }
+  }
+
+  if (adc_frequency_count < 4U)
+  {
+    adc_frequency_history[adc_frequency_count] = raw_frequency_x10;
+    adc_frequency_sum += raw_frequency_x10;
+    adc_frequency_count++;
+  }
+  else
+  {
+    adc_frequency_sum -= adc_frequency_history[adc_frequency_index];
+    adc_frequency_history[adc_frequency_index] = raw_frequency_x10;
+    adc_frequency_sum += raw_frequency_x10;
+    adc_frequency_index = (uint8_t)((adc_frequency_index + 1U) % 4U);
+  }
+
+  return (adc_frequency_sum + adc_frequency_count / 2U) / adc_frequency_count;
+}
+
+/* Make the displayed trace behave like an oscilloscope AUTO timebase.
+   Analysis still uses all 4096 samples.  Once frequency is known, display
+   roughly five periods, align the trace to a valid rising crossing, and
+   retain a small pre-trigger section. */
+static void bsp_adc_fill_scope_trace(BspAdcScopeFrame *frame,
+                                     uint16_t start_index,
+                                     uint32_t sample_rate)
+{
+  uint32_t view_samples = BSP_ADC_CAPTURE_SAMPLE_COUNT;
+  uint32_t trace_start;
+  uint8_t timebase_limited = 0U;
+  uint16_t low_band = (uint16_t)(frame->minimum +
+                      (frame->maximum - frame->minimum) / 8U);
+  uint16_t high_band = (uint16_t)(frame->maximum -
+                       (frame->maximum - frame->minimum) / 8U);
+  uint16_t trigger = 0U;
+  uint16_t first_trigger = 0U;
+  uint8_t trigger_found = 0U;
+  uint8_t first_trigger_found = 0U;
+  uint8_t trigger_armed = 0U;
+  uint16_t trace[BSP_ADC_SCOPE_POINTS];
+
+  if (frame->frequency_x10 != 0U)
+  {
+    uint32_t period_samples = (sample_rate * 10U + frame->frequency_x10 / 2U) /
+                              frame->frequency_x10;
+    uint32_t display_periods = (frame->frequency_x10 <
+                                BSP_ADC_LOW_TIMEBASE_HZ_X10) ? 2U : 5U;
+
+    view_samples = period_samples * display_periods;
+    if (view_samples < BSP_ADC_SCOPE_POINTS) view_samples = BSP_ADC_SCOPE_POINTS;
+    if (view_samples > BSP_ADC_CAPTURE_SAMPLE_COUNT)
+    {
+      view_samples = BSP_ADC_CAPTURE_SAMPLE_COUNT;
+      timebase_limited = 1U;
+    }
+  }
+
+  /* Use a hysteretic low-to-high trigger rather than a single threshold.
+     This prevents a few ADC-noise codes near the midpoint from moving the
+     visible waveform left/right between frames. */
+  for (uint32_t i = 1U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+  {
+    uint16_t current = bsp_adc_ring_sample(start_index, (uint16_t)i);
+
+    if (current <= low_band) trigger_armed = 1U;
+    if ((trigger_armed != 0U) && (current >= high_band))
+    {
+      if (first_trigger_found == 0U)
+      {
+        first_trigger = (uint16_t)i;
+        first_trigger_found = 1U;
+      }
+
+      /* If five periods fit, take the latest edge with enough following
+         data.  If they do not fit (for example 1 Hz), take the first edge
+         and draw the remaining continuous history instead of wrapping or
+         mixing two unrelated phases. */
+      if ((timebase_limited != 0U) ||
+          (i + view_samples <= BSP_ADC_CAPTURE_SAMPLE_COUNT))
+      {
+        if ((timebase_limited == 0U) || (trigger_found == 0U))
+        {
+          trigger = (uint16_t)i;
+          trigger_found = 1U;
+        }
+      }
+      trigger_armed = 0U;
+    }
+  }
+
+  /* A low-frequency frame can contain fewer than the requested display
+     periods after its first edge.  Keep that real edge and shorten only the
+     drawn interval; falling back to an arbitrary phase causes frame-to-frame
+     waveform overlap. */
+  if ((trigger_found == 0U) && (first_trigger_found != 0U))
+  {
+    trigger = first_trigger;
+    trigger_found = 1U;
+    timebase_limited = 1U;
+  }
+
+  if (trigger_found != 0U)
+  {
+    uint32_t pretrigger = view_samples / 8U;
+    trace_start = (trigger > pretrigger) ? (uint32_t)trigger - pretrigger : 0U;
+    if (timebase_limited != 0U)
+      view_samples = BSP_ADC_CAPTURE_SAMPLE_COUNT - trace_start;
+  }
+  else
+  {
+    trace_start = BSP_ADC_CAPTURE_SAMPLE_COUNT - view_samples;
+  }
+
+  if (trace_start + view_samples > BSP_ADC_CAPTURE_SAMPLE_COUNT)
+    trace_start = BSP_ADC_CAPTURE_SAMPLE_COUNT - view_samples;
+
+  for (uint16_t i = 0U; i < BSP_ADC_SCOPE_POINTS; i++)
+  {
+    uint16_t source_index = (uint16_t)(trace_start +
+        ((uint32_t)i * (view_samples - 1U)) / (BSP_ADC_SCOPE_POINTS - 1U));
+    trace[i] = bsp_adc_ring_sample(start_index, source_index);
+  }
+
+  /* The acquisition remains raw for measurement/classification.  Square and
+     sawtooth traces must also remain raw for drawing: any cross-frame or
+     local smoothing smears their true sharp edges.  Sine/triangle retain a
+     same-frame median filter to reject isolated ADC spikes. */
+  if ((frame->waveform == BSP_ADC_WAVE_SQUARE) ||
+      (frame->waveform == BSP_ADC_WAVE_SAWTOOTH))
+  {
+    for (uint16_t i = 0U; i < BSP_ADC_SCOPE_POINTS; i++)
+      frame->samples[i] = trace[i];
+  }
+  else
+  {
+    frame->samples[0] = trace[0];
+    for (uint16_t i = 1U; i < BSP_ADC_SCOPE_POINTS - 1U; i++)
+    {
+      uint16_t a = trace[i - 1U];
+      uint16_t b = trace[i];
+      uint16_t c = trace[i + 1U];
+      uint16_t swap;
+
+      if (a > b) { swap = a; a = b; b = swap; }
+      if (b > c) { swap = b; b = c; c = swap; }
+      if (a > b) { swap = a; a = b; b = swap; }
+      frame->samples[i] = b;
+    }
+    frame->samples[BSP_ADC_SCOPE_POINTS - 1U] = trace[BSP_ADC_SCOPE_POINTS - 1U];
+  }
+}
+
 uint16_t BSP_ADC_Average(void)
 {
   uint32_t sum = 0U;
-  if (adc_started == 0U) {
-    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_samples, 128U) == HAL_OK) adc_started = 1U;
+
+  if (bsp_adc_start_if_needed() == 0U) return 0U;
+  for (uint32_t i = 0U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+    sum += adc_samples[i];
+
+  return (uint16_t)(sum / BSP_ADC_CAPTURE_SAMPLE_COUNT);
+}
+
+uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
+{
+  uint32_t sample_rate;
+  uint32_t required_ms;
+  uint32_t dma_remaining;
+  uint16_t start_index;
+  uint16_t minimum = 4095U;
+  uint16_t maximum = 0U;
+  uint16_t threshold;
+  uint16_t low_band;
+  uint16_t high_band;
+  uint16_t first_rising = 0U;
+  uint16_t last_rising = 0U;
+  uint16_t rising_count = 0U;
+  uint8_t rising_armed = 0U;
+  uint8_t middle_crossed = 0U;
+  uint16_t middle_crossing = 0U;
+  uint32_t extrema_count = 0U;
+  uint32_t period_samples = 0U;
+  uint32_t shape_score_sum = 0U;
+  uint32_t shape_score_count = 0U;
+  uint16_t large_jump_threshold;
+  uint32_t large_jump_count = 0U;
+
+  if (frame == NULL) return 0U;
+  memset(frame, 0, sizeof(*frame));
+  frame->waveform = BSP_ADC_WAVE_UNKNOWN;
+
+  if (bsp_adc_start_if_needed() == 0U) return 0U;
+
+  sample_rate = bsp_adc_sample_rate_hz();
+  if (sample_rate == 0U) return 0U;
+  required_ms = (BSP_ADC_CAPTURE_SAMPLE_COUNT * 1000U + sample_rate - 1U) /
+                sample_rate;
+  if ((uint32_t)(HAL_GetTick() - adc_start_tick) < required_ms) return 0U;
+
+  /* DMA writes the next element at write_index.  That element is the oldest
+     item in a complete circular buffer, so it starts a chronological frame. */
+  dma_remaining = __HAL_DMA_GET_COUNTER(hadc1.DMA_Handle);
+  if (dma_remaining > BSP_ADC_CAPTURE_SAMPLE_COUNT)
+    dma_remaining = BSP_ADC_CAPTURE_SAMPLE_COUNT;
+  start_index = (uint16_t)((BSP_ADC_CAPTURE_SAMPLE_COUNT - dma_remaining) &
+                           BSP_ADC_CAPTURE_MASK);
+
+  for (uint16_t i = 0U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+  {
+    uint16_t sample = bsp_adc_ring_sample(start_index, i);
+    if (sample < minimum) minimum = sample;
+    if (sample > maximum) maximum = sample;
+  }
+
+  frame->minimum = minimum;
+  frame->maximum = maximum;
+  frame->vpp_mv = (uint16_t)(((uint32_t)(maximum - minimum) * 3300U +
+                              2047U) / 4095U);
+
+  frame->valid = 1U;
+  if ((maximum - minimum) < BSP_ADC_MIN_SPAN_CODES)
+  {
+    bsp_adc_fill_scope_trace(frame, start_index, sample_rate);
+    return 1U;
+  }
+
+  threshold = (uint16_t)((minimum + maximum) / 2U);
+  low_band = (uint16_t)(minimum + (maximum - minimum) / 8U);
+  high_band = (uint16_t)(maximum - (maximum - minimum) / 8U);
+  large_jump_threshold = (uint16_t)(((uint32_t)(maximum - minimum) * 2U) / 5U);
+
+  for (uint16_t i = 1U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+  {
+    uint16_t previous = bsp_adc_ring_sample(start_index, (uint16_t)(i - 1U));
+    uint16_t current = bsp_adc_ring_sample(start_index, i);
+    uint16_t step = (current >= previous) ? (current - previous) :
+                                            (previous - current);
+
+    if ((current <= low_band) || (current >= high_band)) extrema_count++;
+    if (step > large_jump_threshold) large_jump_count++;
+
+    /* Count an edge only after it travelled from the lower to the upper
+       hysteresis band.  A noisy sine crossing then cannot create several
+       false periods. */
+    if (current <= low_band)
+    {
+      rising_armed = 1U;
+      middle_crossed = 0U;
+    }
+    if ((rising_armed != 0U) && (middle_crossed == 0U) &&
+        (previous < threshold) && (current >= threshold))
+    {
+      middle_crossing = i;
+      middle_crossed = 1U;
+    }
+    if ((rising_armed != 0U) && (current >= high_band))
+    {
+      if (middle_crossed != 0U)
+      {
+        if (rising_count == 0U) first_rising = middle_crossing;
+        last_rising = middle_crossing;
+        rising_count++;
+      }
+      rising_armed = 0U;
+      middle_crossed = 0U;
+    }
+
+  }
+
+  if ((rising_count >= 2U) && (last_rising > first_rising))
+  {
+    uint32_t interval = (uint32_t)last_rising - first_rising;
+    uint32_t raw_frequency_x10;
+    period_samples = (interval + (rising_count - 1U) / 2U) /
+                     (rising_count - 1U);
+    raw_frequency_x10 = (sample_rate * 10U * (rising_count - 1U) +
+                         interval / 2U) / interval;
+
+    uint32_t target_rate_hz = sample_rate;
+
+    if (sample_rate >= BSP_ADC_FAST_SAMPLE_RATE_HZ)
+    {
+      if (raw_frequency_x10 <= BSP_ADC_MID_ENTER_HZ_X10)
+        target_rate_hz = BSP_ADC_MID_SAMPLE_RATE_HZ;
+    }
+    else if (sample_rate >= BSP_ADC_MID_SAMPLE_RATE_HZ)
+    {
+      if (raw_frequency_x10 <= BSP_ADC_LOW_ENTER_HZ_X10)
+        target_rate_hz = BSP_ADC_LOW_SAMPLE_RATE_HZ;
+      else if (raw_frequency_x10 >= BSP_ADC_FAST_RETURN_HZ_X10)
+        target_rate_hz = BSP_ADC_FAST_SAMPLE_RATE_HZ;
+    }
+    else if (raw_frequency_x10 >= BSP_ADC_MID_RETURN_HZ_X10)
+    {
+      target_rate_hz = BSP_ADC_MID_SAMPLE_RATE_HZ;
+    }
+
+    if (target_rate_hz != sample_rate)
+    {
+      bsp_adc_set_sample_rate(target_rate_hz);
+      return 0U;
+    }
+
+    frame->frequency_x10 = bsp_adc_filter_frequency(raw_frequency_x10);
+  }
+
+  if (rising_count < 2U)
+  {
+    if (sample_rate >= BSP_ADC_FAST_SAMPLE_RATE_HZ)
+    {
+      bsp_adc_set_sample_rate(BSP_ADC_MID_SAMPLE_RATE_HZ);
+      return 0U;
+    }
+    if (sample_rate >= BSP_ADC_MID_SAMPLE_RATE_HZ)
+    {
+      bsp_adc_set_sample_rate(BSP_ADC_LOW_SAMPLE_RATE_HZ);
+      return 0U;
+    }
+
+    /* At the lowest rate, a suddenly applied high-frequency signal can
+       alias into an invalid trace.  Probe the middle rate again so the
+       normal high-frequency path can recover to 80 kHz. */
+    bsp_adc_set_sample_rate(BSP_ADC_MID_SAMPLE_RATE_HZ);
     return 0U;
   }
-  for (uint32_t i = 0U; i < 128U; i++) sum += adc_samples[i];
-  return (uint16_t)(sum / 128U);
+
+  if (extrema_count * 100U >= BSP_ADC_CAPTURE_SAMPLE_COUNT * 80U)
+  {
+    uint8_t high_state = (bsp_adc_ring_sample(start_index, 0U) >= threshold) ? 1U : 0U;
+    uint32_t run_length = 1U;
+    uint32_t longest_high = 0U;
+    uint32_t longest_low = 0U;
+
+    /* Measure complete plateaus rather than relying on one selected edge.
+       The first/last DMA pieces are naturally shorter; the longest high and
+       low runs come from a complete square-wave cycle.  Hysteresis keeps
+       ADC noise around the midpoint from splitting a plateau. */
+    for (uint16_t i = 1U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+    {
+      uint16_t sample = bsp_adc_ring_sample(start_index, i);
+
+      if ((high_state != 0U) && (sample <= low_band))
+      {
+        if (run_length > longest_high) longest_high = run_length;
+        high_state = 0U;
+        run_length = 1U;
+      }
+      else if ((high_state == 0U) && (sample >= high_band))
+      {
+        if (run_length > longest_low) longest_low = run_length;
+        high_state = 1U;
+        run_length = 1U;
+      }
+      else
+      {
+        run_length++;
+      }
+    }
+
+    if (high_state != 0U)
+    {
+      if (run_length > longest_high) longest_high = run_length;
+    }
+    else
+    {
+      if (run_length > longest_low) longest_low = run_length;
+    }
+
+    frame->waveform = BSP_ADC_WAVE_SQUARE;
+    frame->duty_x10 = ((longest_high + longest_low) != 0U) ?
+                      (uint16_t)((longest_high * 1000U +
+                                  (longest_high + longest_low) / 2U) /
+                                  (longest_high + longest_low)) :
+                      0U;
+    bsp_adc_fill_scope_trace(frame, start_index, sample_rate);
+    return 1U;
+  }
+
+  /* A sawtooth has one large return edge in nearly every period.  Requiring
+     repeated full-span jumps avoids classifying a triangle from one noisy
+     ADC sample or one DMA-boundary artifact. */
+  if ((large_jump_count != 0U) && (large_jump_count * 2U >= rising_count))
+  {
+    frame->waveform = BSP_ADC_WAVE_SAWTOOTH;
+    bsp_adc_fill_scope_trace(frame, start_index, sample_rate);
+    return 1U;
+  }
+
+  /* Compare the waveform at four phase points after a confirmed rising
+     midpoint crossing.  Triangle: 75% of span at +/-T/8; sine: about 85%.
+     This is much less sensitive to ADC staircase sampling than derivative
+     variance, and remains independent of amplitude and DC offset. */
+  rising_armed = 0U;
+  middle_crossed = 0U;
+  for (uint16_t i = 1U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
+  {
+    uint16_t previous = bsp_adc_ring_sample(start_index, (uint16_t)(i - 1U));
+    uint16_t current = bsp_adc_ring_sample(start_index, i);
+
+    if (current <= low_band)
+    {
+      rising_armed = 1U;
+      middle_crossed = 0U;
+    }
+    if ((rising_armed != 0U) && (middle_crossed == 0U) &&
+        (previous < threshold) && (current >= threshold))
+    {
+      middle_crossing = i;
+      middle_crossed = 1U;
+    }
+    if ((rising_armed != 0U) && (current >= high_band))
+    {
+      if ((middle_crossed != 0U) &&
+          ((uint32_t)middle_crossing + period_samples * 7U / 8U <
+           BSP_ADC_CAPTURE_SAMPLE_COUNT))
+      {
+        const uint8_t phases[4] = { 1U, 3U, 5U, 7U };
+        for (uint8_t phase = 0U; phase < 4U; phase++)
+        {
+          uint16_t sample = bsp_adc_ring_sample(start_index,
+              (uint16_t)((uint32_t)middle_crossing +
+              period_samples * phases[phase] / 8U));
+          uint32_t level = ((uint32_t)(sample - minimum) * 1000U +
+                            (maximum - minimum) / 2U) /
+                           (maximum - minimum);
+          shape_score_sum += (phase < 2U) ? level : (1000U - level);
+          shape_score_count++;
+        }
+      }
+      rising_armed = 0U;
+      middle_crossed = 0U;
+    }
+  }
+
+  /* Every periodic non-square/non-saw signal starts as sine. */
+  frame->waveform = BSP_ADC_WAVE_SINE;
+  if ((shape_score_count >= 4U) &&
+      (shape_score_sum < shape_score_count * 800U))
+    frame->waveform = BSP_ADC_WAVE_TRIANGLE;
+
+  bsp_adc_fill_scope_trace(frame, start_index, sample_rate);
+  return 1U;
 }
 
 void BSP_DAC_StartTestWave(void)

@@ -16,6 +16,8 @@ extern RTC_HandleTypeDef hrtc;
 #define LVGL_BUF_LINES     10U
 #define CLOCK_DIAL_SIZE    320
 #define CLOCK_DIAL_CENTER  (CLOCK_DIAL_SIZE / 2)
+#define ADC_SCOPE_WIDTH    410
+#define ADC_SCOPE_HEIGHT   230
 
 /* Normal runtime configuration.  Keep these switches only as reversible
    diagnostics; all display, UI and timer paths are enabled. */
@@ -37,7 +39,7 @@ static volatile uint8_t lvgl_started;
 
 static lv_obj_t *main_screen;
 static lv_obj_t *main_clock_label;
-static lv_obj_t *main_menu_buttons[4];
+static lv_obj_t *main_menu_buttons[5];
 static lv_obj_t *clock_face;
 static lv_obj_t *clock_hour_hand;
 static lv_obj_t *clock_minute_hand;
@@ -52,6 +54,13 @@ static lv_obj_t *dac_frequency_digits[5];
 static lv_obj_t *dac_frequency_dot;
 static lv_obj_t *dac_frequency_unit;
 static lv_obj_t *dac_frequency_box;
+static lv_obj_t *adc_screen;
+static lv_obj_t *adc_frequency_label;
+static lv_obj_t *adc_vpp_label;
+static lv_obj_t *adc_wave_label;
+static lv_obj_t *adc_scope_panel;
+static lv_obj_t *adc_scope_line;
+static lv_obj_t *adc_back_button;
 
 static RTC_TimeTypeDef ui_time;
 static RTC_DateTypeDef ui_date;
@@ -63,6 +72,7 @@ static uint8_t ui_dac_selecting_frequency_digit;
 static uint8_t ui_dac_frequency_digit = 1U;
 static uint8_t ui_page;
 static uint32_t ui_last_clock_stamp = 0xFFFFFFFFU;
+static BspAdcScopeFrame ui_adc_scope_frame;
 
 static BspDacConfig ui_dac_config = {
     BSP_DAC_WAVE_SINE,
@@ -75,6 +85,7 @@ static BspDacConfig ui_dac_config = {
 #define UI_PAGE_MAIN      0U
 #define UI_PAGE_SETTINGS  1U
 #define UI_PAGE_DAC       2U
+#define UI_PAGE_ADC       3U
 
 /* Frequency is stored in 0.1 Hz units.  The default selected digit is the
    ones position (10 tenths = 1 Hz), rather than the inconvenient 0.1 Hz. */
@@ -89,6 +100,7 @@ static BspDacConfig ui_dac_config = {
 static lv_point_t clock_hour_points[2];
 static lv_point_t clock_minute_points[2];
 static lv_point_t clock_second_points[2];
+static lv_point_t adc_scope_points[BSP_ADC_SCOPE_POINTS];
 
 /* sin(0..354 degrees in 6 degree steps), scaled by 1000. */
 static const int16_t clock_sin_60[60] = {
@@ -390,6 +402,113 @@ static void ui_select_dac_frequency_digit(int8_t direction)
     ui_update_dac_text();
 }
 
+static const char *ui_adc_waveform_name(BspAdcWaveform waveform)
+{
+    switch (waveform)
+    {
+        case BSP_ADC_WAVE_SINE:     return "Sine";
+        case BSP_ADC_WAVE_SQUARE:   return "Square";
+        case BSP_ADC_WAVE_TRIANGLE: return "Triangle";
+        case BSP_ADC_WAVE_SAWTOOTH: return "Sawtooth";
+        case BSP_ADC_WAVE_UNKNOWN:
+        default:                    return "Unknown";
+    }
+}
+
+static void ui_update_adc_scope(void)
+{
+    uint16_t trace_minimum = 4095U;
+    uint16_t trace_maximum = 0U;
+    uint16_t display_minimum;
+    uint16_t display_maximum;
+    uint32_t raw_span;
+    uint32_t span;
+    uint32_t margin;
+    uint32_t extra_margin;
+
+    if (BSP_ADC_GetScopeFrame(&ui_adc_scope_frame) == 0U)
+    {
+        lv_label_set_text(adc_frequency_label, "Freq: sampling...");
+        lv_label_set_text(adc_vpp_label, "Vpp: --");
+        lv_label_set_text(adc_wave_label, "Wave: --");
+        return;
+    }
+
+    if (ui_adc_scope_frame.frequency_x10 != 0U)
+    {
+        lv_label_set_text_fmt(adc_frequency_label, "Freq: %lu.%lu Hz",
+                              (unsigned long)(ui_adc_scope_frame.frequency_x10 / 10U),
+                              (unsigned long)(ui_adc_scope_frame.frequency_x10 % 10U));
+    }
+    else
+    {
+        lv_label_set_text(adc_frequency_label, "Freq: --");
+    }
+
+    lv_label_set_text_fmt(adc_vpp_label, "Vpp: %u.%02u V",
+                          ui_adc_scope_frame.vpp_mv / 1000U,
+                          (ui_adc_scope_frame.vpp_mv % 1000U) / 10U);
+
+    if (ui_adc_scope_frame.waveform == BSP_ADC_WAVE_SQUARE)
+    {
+        lv_label_set_text_fmt(adc_wave_label, "Wave: Square   Duty: %u.%u%%",
+                              ui_adc_scope_frame.duty_x10 / 10U,
+                              ui_adc_scope_frame.duty_x10 % 10U);
+    }
+    else
+    {
+        lv_label_set_text_fmt(adc_wave_label, "Wave: %s",
+                              ui_adc_waveform_name(ui_adc_scope_frame.waveform));
+    }
+
+    /* AUTO vertical scale uses only the samples that are visible on screen,
+       adds 10% headroom, and leaves a fixed top/bottom margin. */
+    for (uint16_t i = 0U; i < BSP_ADC_SCOPE_POINTS; i++)
+    {
+        if (ui_adc_scope_frame.samples[i] < trace_minimum)
+            trace_minimum = ui_adc_scope_frame.samples[i];
+        if (ui_adc_scope_frame.samples[i] > trace_maximum)
+            trace_maximum = ui_adc_scope_frame.samples[i];
+    }
+
+    raw_span = (uint32_t)trace_maximum - trace_minimum;
+    span = raw_span;
+    /* Do not let AUTO magnify a small idle-input/noise span to full screen.
+       A 100-code minimum is about 80 mV at the ADC input; normal DAC waves
+       above 0.1 Vpp still use the complete available height. */
+    if (span < 100U) span = 100U;
+    margin = span / 10U + 2U;
+    extra_margin = (span - raw_span) / 2U;
+    display_minimum = (trace_minimum > margin + extra_margin) ?
+                      (uint16_t)(trace_minimum - margin - extra_margin) : 0U;
+    display_maximum = ((uint32_t)trace_maximum + margin + extra_margin < 4095U) ?
+                      (uint16_t)(trace_maximum + margin + extra_margin) : 4095U;
+    span = (uint32_t)display_maximum - display_minimum;
+
+    for (uint16_t i = 0U; i < BSP_ADC_SCOPE_POINTS; i++)
+    {
+        adc_scope_points[i].x = (lv_coord_t)(10U +
+            ((uint32_t)i * (ADC_SCOPE_WIDTH - 20U)) /
+            (BSP_ADC_SCOPE_POINTS - 1U));
+
+        if (span < 40U)
+        {
+            adc_scope_points[i].y = ADC_SCOPE_HEIGHT / 2;
+        }
+        else
+        {
+            uint32_t level = (uint32_t)(ui_adc_scope_frame.samples[i] -
+                                         display_minimum);
+            adc_scope_points[i].y = (lv_coord_t)(14U + (ADC_SCOPE_HEIGHT - 28U) -
+                (level * (ADC_SCOPE_HEIGHT - 28U)) / span);
+        }
+    }
+
+    /* Only this line object's old/new bounding area is invalidated.  The
+       static background and other pages are not redrawn. */
+    lv_line_set_points(adc_scope_line, adc_scope_points, BSP_ADC_SCOPE_POINTS);
+}
+
 /* Focused items have a thick white outline.  The actively edited item uses
    a static blue background and reversed white text, avoiding extra redraws. */
 static void ui_update_edit_appearance(void)
@@ -520,10 +639,23 @@ static void ui_show_main(void)
     ui_dac_selecting_frequency_digit = 0U;
     lv_scr_load(main_screen);
     lv_group_remove_all_objs(ui_group);
-    for (uint8_t i = 0U; i < 4U; i++)
+    for (uint8_t i = 0U; i < 5U; i++)
         lv_group_add_obj(ui_group, main_menu_buttons[i]);
     lv_group_focus_obj(main_menu_buttons[0]);
     ui_update_main_clock();
+}
+
+static void ui_show_adc(void)
+{
+    ui_page = UI_PAGE_ADC;
+    ui_editing = 0U;
+    ui_dac_editing = 0U;
+    ui_dac_selecting_frequency_digit = 0U;
+    lv_scr_load(adc_screen);
+    lv_group_remove_all_objs(ui_group);
+    lv_group_add_obj(ui_group, adc_back_button);
+    lv_group_focus_obj(adc_back_button);
+    ui_update_adc_scope();
 }
 
 static void ui_show_settings(void)
@@ -576,15 +708,22 @@ static void ui_button_event(lv_event_t *event)
 
     if (code == LV_EVENT_CLICKED)
     {
-        for (uint8_t i = 0U; i < 4U; i++)
+        for (uint8_t i = 0U; i < 5U; i++)
         {
             if (target == main_menu_buttons[i])
             {
                 if (i == 0U) ui_show_settings();
+                else if (i == 1U) ui_show_adc();
                 else if (i == 2U) ui_show_dac();
-                /* ADC and Alarm are deliberately menu placeholders for now. */
+                /* Alarm and Game are deliberate menu placeholders for now. */
                 return;
             }
+        }
+
+        if (target == adc_back_button)
+        {
+            ui_show_main();
+            return;
         }
 
         for (uint8_t i = 0U; i < 6U; i++)
@@ -792,6 +931,10 @@ static void ui_create(void)
     lv_obj_set_style_bg_color(dac_screen, page_bg, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(dac_screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    adc_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(adc_screen, page_bg, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(adc_screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
 #if (LVGL_DIAG_UI_STAGE == 2U)
     /* DIAG: Widget creation is intentionally bypassed. */
     return;
@@ -831,15 +974,15 @@ static void ui_create(void)
     lv_obj_set_style_border_width(clock_center, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     {
-        static const char *main_menu_names[4] =
-            {"Time Settings", "ADC", "DAC", "Alarm"};
+        static const char *main_menu_names[5] =
+            {"Time Settings", "ADC", "DAC", "Alarm", "Game"};
 
-        for (uint8_t i = 0U; i < 4U; i++)
+        for (uint8_t i = 0U; i < 5U; i++)
         {
             main_menu_buttons[i] = lv_btn_create(main_screen);
-            lv_obj_set_size(main_menu_buttons[i], 430, 64);
+            lv_obj_set_size(main_menu_buttons[i], 430, 60);
             lv_obj_align(main_menu_buttons[i], LV_ALIGN_TOP_MID, 0,
-                         460 + (i * 78));
+                         454 + (i * 65));
             lv_obj_set_style_radius(main_menu_buttons[i], 10,
                                     LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_color(main_menu_buttons[i], panel_bg,
@@ -988,6 +1131,90 @@ static void ui_create(void)
         }
     }
 
+    {
+        lv_obj_t *adc_title = lv_label_create(adc_screen);
+        lv_label_set_text(adc_title, "ADC Scope");
+        lv_obj_set_style_text_color(adc_title, lv_color_white(),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(adc_title, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(adc_title, LV_ALIGN_TOP_MID, 0, 10);
+
+        adc_frequency_label = lv_label_create(adc_screen);
+        lv_label_set_text(adc_frequency_label, "Freq: --");
+        lv_obj_set_style_text_color(adc_frequency_label, lv_color_white(),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(adc_frequency_label, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(adc_frequency_label, LV_ALIGN_TOP_MID, 0, 50);
+
+        adc_vpp_label = lv_label_create(adc_screen);
+        lv_label_set_text(adc_vpp_label, "Vpp: --");
+        lv_obj_set_style_text_color(adc_vpp_label, lv_color_hex(0xA9D5FF),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(adc_vpp_label, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(adc_vpp_label, LV_ALIGN_TOP_MID, 0, 82);
+
+        adc_wave_label = lv_label_create(adc_screen);
+        lv_label_set_text(adc_wave_label, "Wave: --");
+        lv_obj_set_style_text_color(adc_wave_label, lv_color_hex(0xA9D5FF),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(adc_wave_label, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(adc_wave_label, LV_ALIGN_TOP_MID, 0, 114);
+
+        adc_scope_panel = lv_obj_create(adc_screen);
+        lv_obj_set_size(adc_scope_panel, 430, 250);
+        lv_obj_align(adc_scope_panel, LV_ALIGN_TOP_MID, 0, 155);
+        lv_obj_clear_flag(adc_scope_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(adc_scope_panel, 10,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(adc_scope_panel, panel_bg,
+                                  LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(adc_scope_panel, panel_border,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(adc_scope_panel, 2,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_all(adc_scope_panel, 0,
+                                 LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        adc_scope_line = lv_line_create(adc_scope_panel);
+        lv_obj_set_style_line_color(adc_scope_line, lv_color_hex(0x49D17D),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_line_width(adc_scope_line, 2,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_line_rounded(adc_scope_line, true,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+
+        adc_back_button = lv_btn_create(adc_screen);
+        lv_obj_set_size(adc_back_button, 260, 64);
+        lv_obj_align(adc_back_button, LV_ALIGN_TOP_MID, 0, 430);
+        lv_obj_set_style_radius(adc_back_button, 10,
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(adc_back_button, panel_bg,
+                                  LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(adc_back_button, panel_bg,
+                                  LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(adc_back_button, panel_border,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(adc_back_button, 2,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(adc_back_button, lv_color_white(),
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(adc_back_button, 5,
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_add_event_cb(adc_back_button, ui_button_event, LV_EVENT_ALL, NULL);
+
+        lv_obj_t *adc_back_label = lv_label_create(adc_back_button);
+        lv_label_set_text(adc_back_label, "UP: Back");
+        lv_obj_set_style_text_color(adc_back_label, lv_color_white(),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(adc_back_label, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_center(adc_back_label);
+    }
+
     ui_group = lv_group_create();
     lv_group_set_default(ui_group);
     lv_indev_drv_init(&lvgl_indev_drv);
@@ -1038,6 +1265,7 @@ void BSP_LVGL_TickInc(void)
 void BSP_LVGL_Task(void *argument)
 {
     uint32_t last_clock_update = 0U;
+    uint32_t last_adc_update = 0U;
     (void)argument;
 
     for (;;)
@@ -1052,6 +1280,15 @@ void BSP_LVGL_Task(void *argument)
         {
             last_clock_update = now;
             ui_update_main_clock();
+        }
+
+        /* ADC data is acquired continuously by DMA.  Redraw the scope only
+           while its page is visible, at 4 fps, and only inside its line area. */
+        if ((ui_page == UI_PAGE_ADC) &&
+            ((uint32_t)(now - last_adc_update) >= 250U))
+        {
+            last_adc_update = now;
+            ui_update_adc_scope();
         }
 
         osDelay(5U);
