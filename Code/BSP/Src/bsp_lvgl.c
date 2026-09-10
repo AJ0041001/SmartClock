@@ -37,7 +37,7 @@ static volatile uint8_t lvgl_started;
 
 static lv_obj_t *main_screen;
 static lv_obj_t *main_clock_label;
-static lv_obj_t *main_settings_button;
+static lv_obj_t *main_menu_buttons[4];
 static lv_obj_t *clock_face;
 static lv_obj_t *clock_hour_hand;
 static lv_obj_t *clock_minute_hand;
@@ -45,12 +45,44 @@ static lv_obj_t *clock_second_hand;
 static lv_obj_t *settings_screen;
 static lv_obj_t *settings_fields[6];
 static lv_obj_t *settings_values[6];
+static lv_obj_t *dac_screen;
+static lv_obj_t *dac_fields[5];
+static lv_obj_t *dac_values[5];
+static lv_obj_t *dac_frequency_digits[5];
+static lv_obj_t *dac_frequency_dot;
+static lv_obj_t *dac_frequency_unit;
+static lv_obj_t *dac_frequency_box;
 
 static RTC_TimeTypeDef ui_time;
 static RTC_DateTypeDef ui_date;
 static uint8_t ui_field;
 static uint8_t ui_editing;
+static uint8_t ui_dac_field;
+static uint8_t ui_dac_editing;
+static uint8_t ui_dac_selecting_frequency_digit;
+static uint8_t ui_dac_frequency_digit = 1U;
+static uint8_t ui_page;
 static uint32_t ui_last_clock_stamp = 0xFFFFFFFFU;
+
+static BspDacConfig ui_dac_config = {
+    BSP_DAC_WAVE_SINE,
+    33U,     /* 3.3 Vpp maximum; the user can reduce it in 0.1 V steps. */
+    50U,
+    1000U,  /* 100.0 Hz */
+    0U      /* Start paused for safety. */
+};
+
+#define UI_PAGE_MAIN      0U
+#define UI_PAGE_SETTINGS  1U
+#define UI_PAGE_DAC       2U
+
+/* Frequency is stored in 0.1 Hz units.  The default selected digit is the
+   ones position (10 tenths = 1 Hz), rather than the inconvenient 0.1 Hz. */
+#define UI_DAC_FREQ_DIGIT_TENTHS     0U
+#define UI_DAC_FREQ_DIGIT_ONES       1U
+#define UI_DAC_FREQ_DIGIT_TENS       2U
+#define UI_DAC_FREQ_DIGIT_HUNDREDS   3U
+#define UI_DAC_FREQ_DIGIT_THOUSANDS  4U
 
 /* lv_line_set_points() stores the point-array address, so these must have
    static lifetime just like the LVGL driver descriptors. */
@@ -167,6 +199,195 @@ static void ui_update_settings_text(void)
     lv_label_set_text_fmt(settings_values[3], "Year   20%02u", ui_date.Year);
     lv_label_set_text_fmt(settings_values[4], "Month  %02u", ui_date.Month);
     lv_label_set_text_fmt(settings_values[5], "Date   %02u", ui_date.Date);
+}
+
+static const char *ui_dac_wave_name(BspDacWaveform waveform)
+{
+    switch (waveform)
+    {
+        case BSP_DAC_WAVE_SQUARE:   return "Square";
+        case BSP_DAC_WAVE_TRIANGLE: return "Triangle";
+        case BSP_DAC_WAVE_SAWTOOTH: return "Sawtooth";
+        case BSP_DAC_WAVE_SINE:
+        default:                    return "Sine";
+    }
+}
+
+static uint16_t ui_dac_frequency_step_x10(void)
+{
+    static const uint16_t steps[5] = {1U, 10U, 100U, 1000U, 10000U};
+
+    if (ui_dac_frequency_digit > UI_DAC_FREQ_DIGIT_THOUSANDS)
+        ui_dac_frequency_digit = UI_DAC_FREQ_DIGIT_ONES;
+    return steps[ui_dac_frequency_digit];
+}
+
+static void ui_update_dac_frequency_display(void)
+{
+    uint16_t integer_part = (uint16_t)(ui_dac_config.frequency_x10 / 10U);
+    uint8_t digits[5];
+
+    digits[0] = (uint8_t)((integer_part / 1000U) % 10U);
+    digits[1] = (uint8_t)((integer_part / 100U) % 10U);
+    digits[2] = (uint8_t)((integer_part / 10U) % 10U);
+    digits[3] = (uint8_t)(integer_part % 10U);
+    digits[4] = (uint8_t)(ui_dac_config.frequency_x10 % 10U);
+
+    for (uint8_t i = 0U; i < 5U; i++)
+        lv_label_set_text_fmt(dac_frequency_digits[i], "%u", digits[i]);
+
+    if ((ui_dac_selecting_frequency_digit != 0U) ||
+        (ui_dac_editing != 0U && ui_dac_field == 3U))
+    {
+        if (ui_dac_frequency_digit > UI_DAC_FREQ_DIGIT_THOUSANDS)
+            ui_dac_frequency_digit = UI_DAC_FREQ_DIGIT_ONES;
+
+        /* Align to the selected digit object itself, not a guessed pixel
+           coordinate.  This keeps the smaller box exactly centered on it. */
+        lv_obj_align_to(dac_frequency_box,
+                        dac_frequency_digits[UI_DAC_FREQ_DIGIT_THOUSANDS -
+                                             ui_dac_frequency_digit],
+                        LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(dac_frequency_box, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_obj_add_flag(dac_frequency_box, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ui_update_dac_text(void)
+{
+    lv_label_set_text_fmt(dac_values[0], "Waveform   %s",
+                          ui_dac_wave_name(ui_dac_config.waveform));
+    lv_label_set_text_fmt(dac_values[1], "Vpp        %u.%u V",
+                          ui_dac_config.vpp_x10 / 10U,
+                          ui_dac_config.vpp_x10 % 10U);
+    lv_label_set_text_fmt(dac_values[2], "Duty       %u%%",
+                          ui_dac_config.duty_percent);
+    ui_update_dac_frequency_display();
+    lv_label_set_text_fmt(dac_values[4], "Output     %s",
+                          (ui_dac_config.running != 0U) ? "Running" : "Paused");
+}
+
+static void ui_update_dac_appearance(void)
+{
+    const lv_color_t normal_bg = lv_color_hex(0x172033);
+    const lv_color_t normal_text = lv_color_hex(0xF0F4FA);
+    const lv_color_t normal_border = lv_color_hex(0x426080);
+    const lv_color_t blue = lv_color_hex(0x1677FF);
+
+    for (uint8_t i = 0U; i < 5U; i++)
+    {
+        lv_obj_set_style_bg_color(dac_fields[i], normal_bg,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(dac_fields[i], normal_bg,
+                                   LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(dac_fields[i], normal_border,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(dac_fields[i], 2,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(dac_fields[i], lv_color_white(),
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(dac_fields[i], 5,
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(dac_values[i], normal_text,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+
+    if ((ui_dac_editing != 0U) ||
+        (ui_dac_selecting_frequency_digit != 0U))
+    {
+        lv_obj_set_style_bg_color(dac_fields[ui_dac_field], blue,
+                                  LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(dac_fields[ui_dac_field], blue,
+                                  LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(dac_fields[ui_dac_field], lv_color_white(),
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(dac_fields[ui_dac_field], lv_color_white(),
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(dac_fields[ui_dac_field], 7,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(dac_fields[ui_dac_field], 7,
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(dac_values[ui_dac_field], lv_color_white(),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+    }
+}
+
+static void ui_apply_dac_config(void)
+{
+    (void)BSP_DAC_ApplyConfig(&ui_dac_config);
+    ui_update_dac_text();
+}
+
+static void ui_adjust_dac_value(int8_t direction)
+{
+    if (ui_dac_field == 0U)
+    {
+        if (direction > 0)
+            ui_dac_config.waveform = (BspDacWaveform)
+                ((ui_dac_config.waveform + 1U) % 4U);
+        else
+            ui_dac_config.waveform = (ui_dac_config.waveform == BSP_DAC_WAVE_SINE) ?
+                BSP_DAC_WAVE_SAWTOOTH :
+                (BspDacWaveform)(ui_dac_config.waveform - 1U);
+    }
+    else if (ui_dac_field == 1U)
+    {
+        if (direction > 0)
+        {
+            if (ui_dac_config.vpp_x10 < 33U) ui_dac_config.vpp_x10++;
+        }
+        else if (ui_dac_config.vpp_x10 > 0U) ui_dac_config.vpp_x10--;
+    }
+    else if (ui_dac_field == 2U)
+    {
+        if (direction > 0)
+        {
+            if (ui_dac_config.duty_percent < 100U) ui_dac_config.duty_percent++;
+        }
+        else if (ui_dac_config.duty_percent > 0U) ui_dac_config.duty_percent--;
+    }
+    else if (ui_dac_field == 3U)
+    {
+        uint16_t step_x10 = ui_dac_frequency_step_x10();
+
+        if (direction > 0)
+        {
+            /* Addition on the complete fixed-point number intentionally
+               carries across decimal digits: 9.0 + 1 Hz becomes 10.0 Hz. */
+            if (ui_dac_config.frequency_x10 <= (uint16_t)(20000U - step_x10))
+                ui_dac_config.frequency_x10 = (uint16_t)(ui_dac_config.frequency_x10 + step_x10);
+            else
+                ui_dac_config.frequency_x10 = 20000U;
+        }
+        else if (ui_dac_config.frequency_x10 >= step_x10)
+        {
+            ui_dac_config.frequency_x10 = (uint16_t)(ui_dac_config.frequency_x10 - step_x10);
+        }
+        else
+        {
+            ui_dac_config.frequency_x10 = 0U;
+        }
+    }
+
+    if (ui_dac_field < 4U) ui_apply_dac_config();
+}
+
+static void ui_select_dac_frequency_digit(int8_t direction)
+{
+    if (direction > 0)
+    {
+        ui_dac_frequency_digit = (uint8_t)
+            ((ui_dac_frequency_digit + 1U) % 5U);
+    }
+    else
+    {
+        ui_dac_frequency_digit = (ui_dac_frequency_digit == 0U) ? 4U :
+            (uint8_t)(ui_dac_frequency_digit - 1U);
+    }
+    ui_update_dac_text();
 }
 
 /* Focused items have a thick white outline.  The actively edited item uses
@@ -293,17 +514,24 @@ static void ui_adjust_value(int8_t direction)
 
 static void ui_show_main(void)
 {
+    ui_page = UI_PAGE_MAIN;
     ui_editing = 0U;
+    ui_dac_editing = 0U;
+    ui_dac_selecting_frequency_digit = 0U;
     lv_scr_load(main_screen);
     lv_group_remove_all_objs(ui_group);
-    lv_group_add_obj(ui_group, main_settings_button);
-    lv_group_focus_obj(main_settings_button);
+    for (uint8_t i = 0U; i < 4U; i++)
+        lv_group_add_obj(ui_group, main_menu_buttons[i]);
+    lv_group_focus_obj(main_menu_buttons[0]);
     ui_update_main_clock();
 }
 
 static void ui_show_settings(void)
 {
+    ui_page = UI_PAGE_SETTINGS;
     ui_editing = 0U;
+    ui_dac_editing = 0U;
+    ui_dac_selecting_frequency_digit = 0U;
     ui_read_rtc();
     lv_scr_load(settings_screen);
     lv_group_remove_all_objs(ui_group);
@@ -316,6 +544,31 @@ static void ui_show_settings(void)
     ui_update_edit_appearance();
 }
 
+static void ui_show_dac(void)
+{
+    ui_page = UI_PAGE_DAC;
+    ui_editing = 0U;
+    ui_dac_editing = 0U;
+    ui_dac_selecting_frequency_digit = 0U;
+    lv_scr_load(dac_screen);
+    lv_group_remove_all_objs(ui_group);
+
+    for (uint8_t i = 0U; i < 5U; i++)
+        lv_group_add_obj(ui_group, dac_fields[i]);
+
+    lv_group_focus_obj(dac_fields[0]);
+    ui_update_dac_text();
+    ui_update_dac_appearance();
+}
+
+static uint8_t ui_is_editing(void)
+{
+    return (ui_page == UI_PAGE_DAC) ?
+           (uint8_t)((ui_dac_editing != 0U) ||
+                     (ui_dac_selecting_frequency_digit != 0U)) :
+           ui_editing;
+}
+
 static void ui_button_event(lv_event_t *event)
 {
     lv_event_code_t code = lv_event_get_code(event);
@@ -323,10 +576,15 @@ static void ui_button_event(lv_event_t *event)
 
     if (code == LV_EVENT_CLICKED)
     {
-        if (target == main_settings_button)
+        for (uint8_t i = 0U; i < 4U; i++)
         {
-            ui_show_settings();
-            return;
+            if (target == main_menu_buttons[i])
+            {
+                if (i == 0U) ui_show_settings();
+                else if (i == 2U) ui_show_dac();
+                /* ADC and Alarm are deliberately menu placeholders for now. */
+                return;
+            }
         }
 
         for (uint8_t i = 0U; i < 6U; i++)
@@ -346,6 +604,47 @@ static void ui_button_event(lv_event_t *event)
                 return;
             }
         }
+
+        for (uint8_t i = 0U; i < 5U; i++)
+        {
+            if (target == dac_fields[i])
+            {
+                ui_dac_field = i;
+                if (i == 4U)
+                {
+                    /* Output is an action button, not an editable value. */
+                    ui_dac_config.running = (uint8_t)!ui_dac_config.running;
+                    ui_apply_dac_config();
+                    ui_update_dac_appearance();
+                }
+                else if (i == 3U)
+                {
+                    if ((ui_dac_editing == 0U) &&
+                        (ui_dac_selecting_frequency_digit == 0U))
+                    {
+                        /* First confirm selects a position.  Start on the
+                           ones digit so one press changes 1 Hz by default. */
+                        ui_dac_frequency_digit = UI_DAC_FREQ_DIGIT_ONES;
+                        ui_dac_selecting_frequency_digit = 1U;
+                    }
+                    else if (ui_dac_selecting_frequency_digit != 0U)
+                    {
+                        /* Confirm the selected position, then edit it. */
+                        ui_dac_selecting_frequency_digit = 0U;
+                        ui_dac_editing = 1U;
+                    }
+                    ui_update_dac_text();
+                    ui_update_dac_appearance();
+                }
+                else if ((ui_dac_editing == 0U) &&
+                         (ui_dac_selecting_frequency_digit == 0U))
+                {
+                    ui_dac_editing = 1U;
+                    ui_update_dac_appearance();
+                }
+                return;
+            }
+        }
     }
 
     if (code == LV_EVENT_KEY)
@@ -354,7 +653,36 @@ static void ui_button_event(lv_event_t *event)
 
         if (key == LV_KEY_ESC)
         {
-            if (ui_editing != 0U)
+            if (ui_page == UI_PAGE_DAC)
+            {
+                if (ui_dac_editing != 0U)
+                {
+                    ui_dac_editing = 0U;
+                    if (ui_dac_field == 3U)
+                    {
+                        /* Numeric frequency edit -> digit selection. */
+                        ui_dac_selecting_frequency_digit = 1U;
+                    }
+                    else
+                    {
+                        ui_apply_dac_config();
+                    }
+                    ui_update_dac_text();
+                    ui_update_dac_appearance();
+                }
+                else if (ui_dac_selecting_frequency_digit != 0U)
+                {
+                    /* Digit selection -> ordinary DAC field list. */
+                    ui_dac_selecting_frequency_digit = 0U;
+                    ui_update_dac_text();
+                    ui_update_dac_appearance();
+                }
+                else
+                {
+                    ui_show_main();
+                }
+            }
+            else if (ui_editing != 0U)
             {
                 /* Editing -> settings list is one level up.  Commit the
                    displayed value here, rather than on a second confirm. */
@@ -368,12 +696,44 @@ static void ui_button_event(lv_event_t *event)
                 ui_show_main();
             }
         }
-        else if (ui_editing != 0U && key == LV_KEY_LEFT)
+        else if (ui_page == UI_PAGE_DAC &&
+                 ui_dac_selecting_frequency_digit != 0U &&
+                 key == LV_KEY_LEFT)
+        {
+            /* Only digit selection is reversed: KEY2 moves toward the
+               higher place value, while numeric decrement stays unchanged. */
+            ui_select_dac_frequency_digit(1);
+            ui_update_dac_appearance();
+        }
+        else if (ui_page == UI_PAGE_DAC &&
+                 ui_dac_selecting_frequency_digit != 0U &&
+                 key == LV_KEY_RIGHT)
+        {
+            /* KEY0 moves toward the lower place value during selection.
+               In numeric edit it still increases the selected value. */
+            ui_select_dac_frequency_digit(-1);
+            ui_update_dac_appearance();
+        }
+        else if (ui_page == UI_PAGE_DAC && ui_dac_editing != 0U &&
+                 key == LV_KEY_LEFT)
+        {
+            ui_adjust_dac_value(-1);
+            ui_update_dac_appearance();
+        }
+        else if (ui_page == UI_PAGE_DAC && ui_dac_editing != 0U &&
+                 key == LV_KEY_RIGHT)
+        {
+            ui_adjust_dac_value(1);
+            ui_update_dac_appearance();
+        }
+        else if (ui_page == UI_PAGE_SETTINGS && ui_editing != 0U &&
+                 key == LV_KEY_LEFT)
         {
             ui_adjust_value(-1);
             ui_update_edit_appearance();
         }
-        else if (ui_editing != 0U && key == LV_KEY_RIGHT)
+        else if (ui_page == UI_PAGE_SETTINGS && ui_editing != 0U &&
+                 key == LV_KEY_RIGHT)
         {
             ui_adjust_value(1);
             ui_update_edit_appearance();
@@ -389,9 +749,9 @@ static uint32_t ui_map_key(uint8_t key)
            KEY0=1, KEY1=2, KEY2=3, WK_UP=4.
            KEY1 confirms; WK_UP returns; KEY0/KEY2 navigate or +/-.
            KEY0 is deliberately the positive/next direction. */
-        case 1U: return (ui_editing != 0U) ? LV_KEY_RIGHT : LV_KEY_NEXT;
+        case 1U: return (ui_is_editing() != 0U) ? LV_KEY_RIGHT : LV_KEY_NEXT;
         case 2U: return LV_KEY_ENTER;
-        case 3U: return (ui_editing != 0U) ? LV_KEY_LEFT : LV_KEY_PREV;
+        case 3U: return (ui_is_editing() != 0U) ? LV_KEY_LEFT : LV_KEY_PREV;
         case 4U: return LV_KEY_ESC;
         default: return 0U;
     }
@@ -427,6 +787,10 @@ static void ui_create(void)
     settings_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(settings_screen, page_bg, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(settings_screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    dac_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(dac_screen, page_bg, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(dac_screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
 #if (LVGL_DIAG_UI_STAGE == 2U)
     /* DIAG: Widget creation is intentionally bypassed. */
@@ -466,21 +830,42 @@ static void ui_create(void)
     lv_obj_set_style_bg_color(clock_center, lv_color_hex(0x1677FF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(clock_center, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    main_settings_button = lv_btn_create(main_screen);
-    lv_obj_set_size(main_settings_button, 430, 88);
-    lv_obj_align(main_settings_button, LV_ALIGN_CENTER, 0, 150);
-    lv_obj_set_style_radius(main_settings_button, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(main_settings_button, panel_bg, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(main_settings_button, panel_border, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(main_settings_button, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(main_settings_button, lv_color_white(), LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(main_settings_button, 5, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_add_event_cb(main_settings_button, ui_button_event, LV_EVENT_ALL, NULL);
-    lv_obj_t *main_button_label = lv_label_create(main_settings_button);
-    lv_label_set_text(main_button_label, "Time Settings");
-    lv_obj_set_style_text_color(main_button_label, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(main_button_label, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_center(main_button_label);
+    {
+        static const char *main_menu_names[4] =
+            {"Time Settings", "ADC", "DAC", "Alarm"};
+
+        for (uint8_t i = 0U; i < 4U; i++)
+        {
+            main_menu_buttons[i] = lv_btn_create(main_screen);
+            lv_obj_set_size(main_menu_buttons[i], 430, 64);
+            lv_obj_align(main_menu_buttons[i], LV_ALIGN_TOP_MID, 0,
+                         460 + (i * 78));
+            lv_obj_set_style_radius(main_menu_buttons[i], 10,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(main_menu_buttons[i], panel_bg,
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(main_menu_buttons[i], panel_bg,
+                                      LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(main_menu_buttons[i], panel_border,
+                                          LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(main_menu_buttons[i], 2,
+                                          LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_color(main_menu_buttons[i], lv_color_white(),
+                                          LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_set_style_border_width(main_menu_buttons[i], 5,
+                                          LV_PART_MAIN | LV_STATE_FOCUSED);
+            lv_obj_add_event_cb(main_menu_buttons[i], ui_button_event,
+                                LV_EVENT_ALL, NULL);
+
+            lv_obj_t *main_button_label = lv_label_create(main_menu_buttons[i]);
+            lv_label_set_text(main_button_label, main_menu_names[i]);
+            lv_obj_set_style_text_color(main_button_label, lv_color_white(),
+                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_font(main_button_label, &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_center(main_button_label);
+        }
+    }
 
     lv_obj_t *title = lv_label_create(settings_screen);
     lv_label_set_text(title, "Adjust Time / Date");
@@ -500,6 +885,107 @@ static void ui_create(void)
         lv_obj_set_style_text_font(settings_values[i], &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_label_set_text(settings_values[i], field_names[i]);
         lv_obj_center(settings_values[i]);
+    }
+
+    {
+        static const char *dac_field_names[5] =
+            {"Waveform", "Vpp", "Duty", "Frequency", "Output"};
+
+        lv_obj_t *dac_title = lv_label_create(dac_screen);
+        lv_label_set_text(dac_title, "DAC Waveform Output");
+        lv_obj_set_style_text_color(dac_title, lv_color_white(),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(dac_title, &lv_font_montserrat_24,
+                                   LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(dac_title, LV_ALIGN_TOP_MID, 0, 10);
+
+        for (uint8_t i = 0U; i < 5U; i++)
+        {
+            dac_fields[i] = lv_btn_create(dac_screen);
+            lv_obj_set_size(dac_fields[i], 430, 88);
+            lv_obj_align(dac_fields[i], LV_ALIGN_TOP_MID, 0, 78 + (i * 112));
+            lv_obj_set_style_radius(dac_fields[i], 10,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_font(dac_fields[i], &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_add_event_cb(dac_fields[i], ui_button_event, LV_EVENT_ALL, NULL);
+            dac_values[i] = lv_label_create(dac_fields[i]);
+            lv_obj_set_style_text_font(dac_values[i], &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_label_set_text(dac_values[i], dac_field_names[i]);
+            lv_obj_center(dac_values[i]);
+        }
+
+        /* Frequency is rendered as separate, fixed-position digit labels.
+           The selection box is therefore attached to a real digit position,
+           not to an estimated character column in a formatted string. */
+        lv_obj_del(dac_values[3]);
+        {
+            lv_obj_t *dac_frequency_row = lv_obj_create(dac_fields[3]);
+            lv_obj_set_size(dac_frequency_row, 300, 38);
+            lv_obj_align(dac_frequency_row, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_bg_opa(dac_frequency_row, LV_OPA_TRANSP,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(dac_frequency_row, 0,
+                                          LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_all(dac_frequency_row, 0,
+                                     LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_clear_flag(dac_frequency_row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(dac_frequency_row, LV_OBJ_FLAG_CLICKABLE);
+
+            dac_values[3] = lv_label_create(dac_frequency_row);
+            lv_label_set_text(dac_values[3], "Frequency");
+            lv_obj_set_style_text_font(dac_values[3], &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_align(dac_values[3], LV_ALIGN_LEFT_MID, 10, 0);
+
+            for (uint8_t i = 0U; i < 5U; i++)
+            {
+                static const lv_coord_t digit_x[5] = {150, 169, 188, 207, 235};
+
+                dac_frequency_digits[i] = lv_label_create(dac_frequency_row);
+                lv_obj_set_width(dac_frequency_digits[i], 18);
+                lv_obj_align(dac_frequency_digits[i], LV_ALIGN_LEFT_MID,
+                             digit_x[i], 0);
+                lv_obj_set_style_text_align(dac_frequency_digits[i], LV_TEXT_ALIGN_CENTER,
+                                            LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(dac_frequency_digits[i], &lv_font_montserrat_24,
+                                           LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_color(dac_frequency_digits[i], lv_color_hex(0xF0F4FA),
+                                            LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_label_set_text(dac_frequency_digits[i], "0");
+            }
+
+            dac_frequency_dot = lv_label_create(dac_frequency_row);
+            lv_label_set_text(dac_frequency_dot, ".");
+            lv_obj_align(dac_frequency_dot, LV_ALIGN_LEFT_MID, 226, 0);
+            lv_obj_set_style_text_font(dac_frequency_dot, &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_color(dac_frequency_dot, lv_color_hex(0xF0F4FA),
+                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+
+            dac_frequency_unit = lv_label_create(dac_frequency_row);
+            lv_label_set_text(dac_frequency_unit, "Hz");
+            lv_obj_align(dac_frequency_unit, LV_ALIGN_LEFT_MID, 257, 0);
+            lv_obj_set_style_text_font(dac_frequency_unit, &lv_font_montserrat_24,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_color(dac_frequency_unit, lv_color_hex(0xF0F4FA),
+                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+
+            dac_frequency_box = lv_obj_create(dac_frequency_row);
+            lv_obj_set_size(dac_frequency_box, 20, 32);
+            lv_obj_set_style_bg_opa(dac_frequency_box, LV_OPA_TRANSP,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_color(dac_frequency_box, lv_color_white(),
+                                          LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(dac_frequency_box, 2,
+                                          LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_radius(dac_frequency_box, 3,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_clear_flag(dac_frequency_box, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(dac_frequency_box, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(dac_frequency_box, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     ui_group = lv_group_create();
