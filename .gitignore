@@ -1,0 +1,21 @@
+# Keil/MDK build outputs and host-local settings
+Code/MDK-ARM/SmartClock_F407/
+Code/MDK-ARM/*.uvguix.*
+Code/MDK-ARM/*.uvoptx
+Code/MDK-ARM/.vscode/
+Code/MDK-ARM/*.log
+Code/MDK-ARM/*.lst
+
+# Common compiler/linker outputs
+*.axf
+*.hex
+*.map
+*.o
+*.d
+*.crf
+*.dep
+*.htm
+*.bak
+
+# Redundant upstream LVGL archive; the project uses Middlewares/Third_Party/lvgl/src
+Code/lvgl-8.3.11/
