@@ -27,6 +27,7 @@ typedef struct
   uint16_t samples[BSP_ADC_SCOPE_POINTS];
   uint16_t minimum;
   uint16_t maximum;
+  uint16_t dc_mv;
   uint16_t vpp_mv;
   uint32_t frequency_x10;
   uint16_t duty_x10;
@@ -58,8 +59,52 @@ uint8_t BSP_DAC_ApplyConfig(const BspDacConfig *config);
 void BSP_DAC_Stop(void);
 uint8_t BSP_Audio_InitAndStartTone(void);
 void BSP_Audio_Stop(void);
+uint8_t BSP_Audio_PlayHour(uint8_t hour);
+void BSP_Audio_RequestHour(uint8_t hour);
+uint8_t BSP_Audio_PlayTestVoice(void);
+void BSP_Audio_SetVoicePack(uint8_t pack);
+void BSP_Audio_SetVolume(uint8_t percent);
+uint8_t BSP_Audio_GetVolume(void);
+
+typedef enum
+{
+  BSP_AUDIO_EFFECT_STAR1 = 0U,
+  BSP_AUDIO_EFFECT_STAR2,
+  BSP_AUDIO_EFFECT_GAMEOVER,
+  BSP_AUDIO_EFFECT_BOMB
+} BspAudioEffect;
+
+uint8_t BSP_Audio_PlayEffect(BspAudioEffect effect);
+void BSP_Audio_RequestEffect(BspAudioEffect effect);
+void BSP_Audio_ProcessPending(void);
+uint8_t BSP_Audio_GetLastFatFsResult(void);
+uint8_t BSP_Audio_GetLastStatus(void);
+uint8_t BSP_Audio_GetLastHour(void);
+void BSP_TimeChime_SetEnabled(uint8_t enabled);
+uint8_t BSP_TimeChime_IsEnabled(void);
+void BSP_TimeChime_SetTimeEditing(uint8_t editing);
+uint8_t BSP_TimeChime_IsTimeEditing(void);
+void BSP_TimeChime_RequestAfterTimeEdit(void);
+uint8_t BSP_TimeChime_IsAfterTimeEditPending(void);
+void BSP_TimeChime_ClearAfterTimeEdit(void);
 uint8_t BSP_LCD_InitAndShow(void);
 uint8_t BSP_SD_MountAndProbe(void);
+
+/* Game remote-control input received from USART2.  TYPE 01 means that the
+   latest X coordinate is combined with keypad movement; TYPE 02 means that
+   the serial coordinates are ignored and the keypad has exclusive control. */
+typedef struct
+{
+  uint8_t mode;
+  uint16_t x;
+  uint16_t y;
+  uint32_t generation;
+  uint32_t last_tick;
+} BspGameSerialControl;
+
+void BSP_GameSerial_Start(void);
+uint8_t BSP_GameSerial_GetLatest(BspGameSerialControl *control);
+void BSP_GameSerial_Service(void);
 
 /* The two user alarms are backed by the STM32 RTC Alarm A and Alarm B
    hardware.  `enabled` controls the normal once-per-day schedule. */

@@ -94,7 +94,7 @@ DSTATUS USER_initialize (
   /* USER CODE BEGIN INIT */
     (void)pdrv;
     if (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) {
-      if (HAL_SD_Init(&hsd) != HAL_OK || HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK) {
+      if (HAL_SD_Init(&hsd) != HAL_OK) {
         Stat = STA_NOINIT;
         return Stat;
       }
@@ -115,7 +115,9 @@ DSTATUS USER_status (
 {
   /* USER CODE BEGIN STATUS */
     (void)pdrv;
-    Stat = (HAL_SD_GetCardState(&hsd) == HAL_SD_CARD_TRANSFER) ? 0U : STA_NOINIT;
+    /* Return the initialization result recorded by USER_initialize(). Do not
+       replace it with a transient card state while FatFs is mounting or while
+       a sector transfer is settling. */
     return Stat;
   /* USER CODE END STATUS */
 }
@@ -185,6 +187,7 @@ DRESULT USER_ioctl (
   /* USER CODE BEGIN IOCTL */
     HAL_SD_CardInfoTypeDef info;
     (void)pdrv;
+    if (buff == NULL) return RES_PARERR;
     if ((Stat & STA_NOINIT) != 0U) return RES_NOTRDY;
     switch (cmd) {
       case CTRL_SYNC: return SD_WaitTransfer(5000U);
@@ -192,7 +195,10 @@ DRESULT USER_ioctl (
         if (HAL_SD_GetCardInfo(&hsd, &info) != HAL_OK) return RES_ERROR;
         *(DWORD *)buff = (DWORD)info.LogBlockNbr;
         return RES_OK;
-      case GET_SECTOR_SIZE: *(WORD *)buff = (WORD)info.LogBlockSize; return RES_OK;
+      case GET_SECTOR_SIZE:
+        if (HAL_SD_GetCardInfo(&hsd, &info) != HAL_OK) return RES_ERROR;
+        *(WORD *)buff = (WORD)info.LogBlockSize;
+        return RES_OK;
       case GET_BLOCK_SIZE: *(DWORD *)buff = 1U; return RES_OK;
       default: return RES_PARERR;
     }
