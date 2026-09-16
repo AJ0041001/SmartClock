@@ -1,0 +1,59 @@
+camera:
+  index: 0
+  width: 640
+  height: 480
+  fps: 30
+  fourcc: MJPG
+detector:
+  engine: yolo
+  model_path: ''
+  conf_threshold: 0.5
+  nms_threshold: 0.45
+  input_size: 640
+  core_mask: 7
+  box_format: auto
+  warmup: true
+  preset: red
+  custom_ranges: []
+  min_area: 400.0
+  max_area: null
+  blur_size: 5
+  morph_kernel: 5
+  morph_iterations: 2
+  max_blocks: 1
+  roi_x: 176
+  roi_y: 14
+  roi_w: 280
+  roi_h: 380
+  roi_margin: 60
+mapping:
+  roi_x: 226
+  roi_y: 64
+  roi_w: 180
+  roi_h: 280
+  invert_x: false
+  invert_y: false
+  swap_xy: false
+  fixed_y: null
+  smoothing: 0.35
+  deadband: 2.0
+serial:
+  port: auto
+  baudrate: 115200
+  timeout: 0.5
+  require_ack: false
+  auto_probe_limit: 6
+loop:
+  target_fps: 20.0
+  send_interval: 0.05
+  lost_frames: 5
+  reacquire_delay: 0.3
+debug:
+  preview: true
+  ui_layout: overlay
+  show_guide: false
+  save_frames: false
+  save_dir: assets/output
+  save_interval: 30
+  log_level: INFO
+control_type: 1

@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['card']
+
+roboflow:
+  workspace: 424481978-qq-com
+  project: redcard
+  version: dataset
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/424481978-qq-com/redcard/dataset/dataset

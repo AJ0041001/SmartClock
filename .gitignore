@@ -19,3 +19,18 @@ Code/MDK-ARM/*.lst
 
 # Redundant upstream LVGL archive; the project uses Middlewares/Third_Party/lvgl/src
 Code/lvgl-8.3.11/
+
+# ── 视觉端（Visual/color_block）────────────────────────────────────────
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 打包产物：体积大且可由 `bash tools/package.sh` 随时重新生成
+Visual/color_block/dist/
+
+# 运行期落盘（抓帧、处理结果）；示例图与交付文档仍然入库
+Visual/color_block/assets/output/captures/
+Visual/color_block/assets/output/frame_*.jpg
+# demo_edge_center.py 每次运行都会重画这两张图，仓库里保留 docs/images/ 那份即可
+Visual/color_block/assets/output/edge_center_*.png
