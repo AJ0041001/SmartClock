@@ -5,6 +5,10 @@
 #include "wm8978.h"
 #include "lcd.h"
 #include "fatfs.h"
+#include "cmsis_os.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <stdio.h>
 #include <string.h>
 
 extern ADC_HandleTypeDef hadc1;
@@ -13,11 +17,13 @@ extern I2S_HandleTypeDef hi2s2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
 extern RTC_HandleTypeDef hrtc;
 
 #define BSP_ADC_CAPTURE_SAMPLE_COUNT 4096U
 #define BSP_ADC_CAPTURE_MASK         (BSP_ADC_CAPTURE_SAMPLE_COUNT - 1U)
 #define BSP_ADC_MIN_SPAN_CODES       40U
+#define BSP_ADC_VALID_MARGIN         (BSP_ADC_CAPTURE_SAMPLE_COUNT / 32U)
 #define BSP_ADC_FAST_SAMPLE_RATE_HZ  80000U
 #define BSP_ADC_MID_SAMPLE_RATE_HZ   20000U
 #define BSP_ADC_LOW_SAMPLE_RATE_HZ   1600U
@@ -30,8 +36,59 @@ extern RTC_HandleTypeDef hrtc;
 static volatile uint16_t adc_samples[BSP_ADC_CAPTURE_SAMPLE_COUNT];
 static uint16_t dac_samples[128];
 static uint16_t audio_samples[128];
+/* Read mono PCM, then expand it in-place to L/R for I2S2. */
+#define BSP_AUDIO_PCM_FRAMES 2048U
+static uint16_t audio_wav_stereo[BSP_AUDIO_PCM_FRAMES * 2U];
 static uint8_t adc_started;
 static uint8_t audio_started;
+static uint8_t audio_codec_ready;
+static uint8_t audio_fs_mounted;
+static volatile uint8_t audio_last_fresult;
+static volatile uint8_t audio_last_status;
+static volatile uint8_t audio_last_hour;
+static volatile uint8_t audio_dma_done;
+static volatile uint8_t audio_dma_error;
+static volatile uint8_t audio_output_muted = 1U;
+/* The SD card supplied for this project contains the Taffy files t1..t24.
+   Keep Taffy as the power-on default; the UI can still select the default
+   1..24.wav pack explicitly. */
+static volatile uint8_t audio_voice_pack = 1U;
+/* 0 = MO LE files in the SD-card root, 1 = Miao files in /Miao. */
+static volatile uint8_t audio_game_music_pack;
+static volatile uint8_t audio_volume_percent = 70U;
+#define BSP_AUDIO_EFFECT_QUEUE_SIZE 8U
+static volatile uint8_t audio_effect_queue[BSP_AUDIO_EFFECT_QUEUE_SIZE];
+static volatile uint8_t audio_effect_head;
+static volatile uint8_t audio_effect_tail;
+static volatile uint8_t audio_effect_playing;
+static volatile uint8_t audio_effect_cancel;
+static volatile uint8_t audio_playback_active;
+static volatile uint8_t audio_hour_pending;
+static volatile uint8_t audio_hour_value;
+static uint8_t audio_effect_retry_count;
+/* Enable hourly voice chime after reset; the Voice Packs page can still turn
+   it off explicitly.  This setting is runtime-only and is not persisted. */
+static volatile uint8_t bsp_time_chime_enabled;
+static volatile uint8_t bsp_time_chime_time_editing;
+static volatile uint8_t bsp_time_chime_after_edit_pending;
+/* USART2 game-control receiver.  USART2_RX is mapped to DMA1 Stream5 on
+   STM32F407, but Stream5 is already used by DAC channel 1.  Use receive-to-
+   idle interrupt mode here so the DAC waveform DMA remains untouched. */
+#define BSP_GAME_UART_DMA_SIZE 64U
+#define BSP_GAME_FRAME_SIZE    10U
+#define BSP_GAME_RESPONSE_QUEUE_SIZE 32U
+static uint8_t bsp_game_uart_dma[BSP_GAME_UART_DMA_SIZE];
+static uint8_t bsp_game_frame[BSP_GAME_FRAME_SIZE];
+static uint8_t bsp_game_frame_index;
+static uint16_t bsp_game_uart_last_pos;
+static volatile uint8_t bsp_game_response_queue[BSP_GAME_RESPONSE_QUEUE_SIZE];
+static volatile uint8_t bsp_game_response_head;
+static volatile uint8_t bsp_game_response_tail;
+static volatile uint8_t bsp_game_serial_mode = 2U;
+static volatile uint16_t bsp_game_serial_x;
+static volatile uint16_t bsp_game_serial_y;
+static volatile uint32_t bsp_game_serial_generation;
+static volatile uint32_t bsp_game_serial_last_tick;
 static uint32_t adc_start_tick;
 static uint32_t adc_frequency_history[4];
 static uint32_t adc_frequency_sum;
@@ -148,6 +205,176 @@ static uint16_t bsp_dac_wave_sample(const BspDacConfig *config,
 void BSP_Log(const char *text)
 {
   if (text != NULL) HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)strlen(text), 100U);
+}
+
+static uint8_t bsp_game_crc8(const uint8_t *data, uint8_t length)
+{
+  uint8_t crc = 0U;
+
+  for (uint8_t i = 0U; i < length; i++)
+  {
+    crc ^= data[i];
+    for (uint8_t bit = 0U; bit < 8U; bit++)
+      crc = (crc & 0x80U) ? (uint8_t)((crc << 1U) ^ 0x07U) : (uint8_t)(crc << 1U);
+  }
+  return crc;
+}
+
+static void bsp_game_queue_response(uint8_t ok)
+{
+  uint8_t next = (uint8_t)((bsp_game_response_head + 1U) %
+                           BSP_GAME_RESPONSE_QUEUE_SIZE);
+
+  /* This function is called from the DMA/USART interrupt context.  Queue only
+     the result here; the actual UART transmission is done by the LVGL task. */
+  if (next == bsp_game_response_tail) return;
+  bsp_game_response_queue[bsp_game_response_head] = (ok != 0U) ? 1U : 0U;
+  bsp_game_response_head = next;
+}
+
+static void bsp_game_publish_frame(void)
+{
+  uint8_t type = bsp_game_frame[3];
+  uint8_t valid = 1U;
+  uint16_t x = (uint16_t)bsp_game_frame[4] |
+               (uint16_t)((uint16_t)bsp_game_frame[5] << 8U);
+  uint16_t y = (uint16_t)bsp_game_frame[6] |
+               (uint16_t)((uint16_t)bsp_game_frame[7] << 8U);
+
+  if (bsp_game_frame[0] != 0xAAU || bsp_game_frame[1] != 0x55U) valid = 0U;
+  if (bsp_game_frame[2] != 6U) valid = 0U;
+  if ((type != 1U) && (type != 2U)) valid = 0U;
+  if (bsp_game_crc8(&bsp_game_frame[2], 7U) != bsp_game_frame[9]) valid = 0U;
+
+  bsp_game_queue_response(valid);
+  if (valid == 0U) return;
+
+  /* The 32-bit generation lets the LVGL task consume only new frames.  The
+     interrupt never touches an LVGL object. */
+  bsp_game_serial_mode = type;
+  bsp_game_serial_x = x;
+  bsp_game_serial_y = y;
+  bsp_game_serial_last_tick = HAL_GetTick();
+  bsp_game_serial_generation++;
+}
+
+static void bsp_game_feed_byte(uint8_t byte)
+{
+  if (bsp_game_frame_index == 0U)
+  {
+    if (byte == 0xAAU) bsp_game_frame[bsp_game_frame_index++] = byte;
+    return;
+  }
+
+  if (bsp_game_frame_index == 1U)
+  {
+    if (byte == 0x55U)
+    {
+      bsp_game_frame[bsp_game_frame_index++] = byte;
+    }
+    else
+    {
+      bsp_game_frame_index = (byte == 0xAAU) ? 1U : 0U;
+      if (bsp_game_frame_index != 0U) bsp_game_frame[0] = byte;
+    }
+    return;
+  }
+
+  bsp_game_frame[bsp_game_frame_index++] = byte;
+  if (bsp_game_frame_index >= BSP_GAME_FRAME_SIZE)
+  {
+    bsp_game_publish_frame();
+    bsp_game_frame_index = 0U;
+  }
+}
+
+void BSP_GameSerial_Start(void)
+{
+  bsp_game_frame_index = 0U;
+  bsp_game_uart_last_pos = 0U;
+  bsp_game_serial_mode = 2U;
+  bsp_game_serial_x = 0U;
+  bsp_game_serial_y = 0U;
+  bsp_game_serial_generation = 0U;
+  bsp_game_serial_last_tick = 0U;
+  bsp_game_response_head = 0U;
+  bsp_game_response_tail = 0U;
+  (void)HAL_UARTEx_ReceiveToIdle_IT(&huart2, bsp_game_uart_dma,
+                                    BSP_GAME_UART_DMA_SIZE);
+}
+
+void BSP_GameSerial_Service(void)
+{
+  static const uint8_t ok_response[] = {'O', 'K', '\r', '\n'};
+  static const uint8_t error_response[] = {'E', 'R', 'R', 'O', 'R', '\r', '\n'};
+  uint8_t result;
+  uint8_t count = 0U;
+
+  /* Keep the per-call work bounded so a burst of test frames cannot make the
+     LVGL task stay in UART transmission for an unbounded time. */
+  while ((bsp_game_response_tail != bsp_game_response_head) && (count < 4U))
+  {
+    result = bsp_game_response_queue[bsp_game_response_tail];
+    bsp_game_response_tail = (uint8_t)((bsp_game_response_tail + 1U) %
+                                       BSP_GAME_RESPONSE_QUEUE_SIZE);
+    if (result != 0U)
+      (void)HAL_UART_Transmit(&huart2, (uint8_t *)ok_response,
+                              (uint16_t)sizeof(ok_response), 10U);
+    else
+      (void)HAL_UART_Transmit(&huart2, (uint8_t *)error_response,
+                              (uint16_t)sizeof(error_response), 10U);
+    count++;
+  }
+}
+
+uint8_t BSP_GameSerial_GetLatest(BspGameSerialControl *control)
+{
+  uint32_t generation_a;
+  uint32_t generation_b;
+
+  if (control == NULL) return 0U;
+
+  /* Retry if the DMA callback updates the snapshot while it is being read. */
+  do
+  {
+    generation_a = bsp_game_serial_generation;
+    control->mode = bsp_game_serial_mode;
+    control->x = bsp_game_serial_x;
+    control->y = bsp_game_serial_y;
+    control->last_tick = bsp_game_serial_last_tick;
+    generation_b = bsp_game_serial_generation;
+  } while (generation_a != generation_b);
+
+  control->generation = generation_b;
+  return (generation_b != 0U) ? 1U : 0U;
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+{
+  uint16_t i;
+
+  if (huart != &huart2) return;
+
+  /* Interrupt-mode reception uses a linear buffer.  Size is the number of
+     valid bytes in this callback, not a circular DMA write position. */
+  if (size > BSP_GAME_UART_DMA_SIZE) size = BSP_GAME_UART_DMA_SIZE;
+  for (i = 0U; i < size; i++) bsp_game_feed_byte(bsp_game_uart_dma[i]);
+  bsp_game_uart_last_pos = 0U;
+
+  /* Re-arm after both IDLE and full-buffer events. */
+  (void)HAL_UARTEx_ReceiveToIdle_IT(&huart2, bsp_game_uart_dma,
+                                    BSP_GAME_UART_DMA_SIZE);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart == &huart2)
+  {
+    bsp_game_uart_last_pos = 0U;
+    bsp_game_frame_index = 0U;
+    (void)HAL_UARTEx_ReceiveToIdle_IT(&huart2, bsp_game_uart_dma,
+                                      BSP_GAME_UART_DMA_SIZE);
+  }
 }
 
 void BSP_LED_Set(uint8_t led, uint8_t on)
@@ -430,13 +657,15 @@ static uint16_t bsp_adc_ring_sample(uint16_t start_index, uint16_t offset)
   return adc_samples[(start_index + offset) & BSP_ADC_CAPTURE_MASK];
 }
 
-/* The raw period estimate is quantized to ADC sample positions.  A four-frame
-   average makes the reported value stable while keeping a genuine, large
-   frequency change responsive by resetting the short history. */
+/* The raw period estimate is quantized to ADC sample positions.  A short
+   history makes the reported value stable while keeping a genuine, large
+   frequency change responsive by resetting the history. */
 static uint32_t bsp_adc_filter_frequency(uint32_t raw_frequency_x10)
 {
   uint32_t average;
   uint32_t difference;
+  uint32_t sorted[4];
+  uint32_t swap;
 
   if (raw_frequency_x10 == 0U)
   {
@@ -473,7 +702,28 @@ static uint32_t bsp_adc_filter_frequency(uint32_t raw_frequency_x10)
     adc_frequency_index = (uint8_t)((adc_frequency_index + 1U) % 4U);
   }
 
-  return (adc_frequency_sum + adc_frequency_count / 2U) / adc_frequency_count;
+  if (adc_frequency_count < 4U)
+    return (adc_frequency_sum + adc_frequency_count / 2U) /
+           adc_frequency_count;
+
+  /* With four samples, use the middle two instead of the arithmetic mean.
+     One incorrectly detected edge can then affect only one frame and cannot
+     pull the displayed frequency toward a wrong value. */
+  for (uint8_t i = 0U; i < 4U; i++)
+    sorted[i] = adc_frequency_history[i];
+  for (uint8_t i = 0U; i < 3U; i++)
+  {
+    for (uint8_t j = (uint8_t)(i + 1U); j < 4U; j++)
+    {
+      if (sorted[j] < sorted[i])
+      {
+        swap = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = swap;
+      }
+    }
+  }
+  return (sorted[1] + sorted[2] + 1U) / 2U;
 }
 
 /* Make the displayed trace behave like an oscilloscope AUTO timebase.
@@ -580,33 +830,23 @@ static void bsp_adc_fill_scope_trace(BspAdcScopeFrame *frame,
     trace[i] = bsp_adc_ring_sample(start_index, source_index);
   }
 
-  /* The acquisition remains raw for measurement/classification.  Square and
-     sawtooth traces must also remain raw for drawing: any cross-frame or
-     local smoothing smears their true sharp edges.  Sine/triangle retain a
-     same-frame median filter to reject isolated ADC spikes. */
-  if ((frame->waveform == BSP_ADC_WAVE_SQUARE) ||
-      (frame->waveform == BSP_ADC_WAVE_SAWTOOTH))
+  /* Keep acquisition/measurement raw, but remove isolated display spikes
+     with a 3-point median.  A median does not smear a square-wave edge like
+     an arithmetic average would, and also makes sawtooth lines steadier. */
+  frame->samples[0] = trace[0];
+  for (uint16_t i = 1U; i < BSP_ADC_SCOPE_POINTS - 1U; i++)
   {
-    for (uint16_t i = 0U; i < BSP_ADC_SCOPE_POINTS; i++)
-      frame->samples[i] = trace[i];
-  }
-  else
-  {
-    frame->samples[0] = trace[0];
-    for (uint16_t i = 1U; i < BSP_ADC_SCOPE_POINTS - 1U; i++)
-    {
-      uint16_t a = trace[i - 1U];
-      uint16_t b = trace[i];
-      uint16_t c = trace[i + 1U];
-      uint16_t swap;
+    uint16_t a = trace[i - 1U];
+    uint16_t b = trace[i];
+    uint16_t c = trace[i + 1U];
+    uint16_t swap;
 
-      if (a > b) { swap = a; a = b; b = swap; }
-      if (b > c) { swap = b; b = c; c = swap; }
-      if (a > b) { swap = a; a = b; b = swap; }
-      frame->samples[i] = b;
-    }
-    frame->samples[BSP_ADC_SCOPE_POINTS - 1U] = trace[BSP_ADC_SCOPE_POINTS - 1U];
+    if (a > b) { swap = a; a = b; b = swap; }
+    if (b > c) { swap = b; b = c; c = swap; }
+    if (a > b) { swap = a; a = b; b = swap; }
+    frame->samples[i] = b;
   }
+  frame->samples[BSP_ADC_SCOPE_POINTS - 1U] = trace[BSP_ADC_SCOPE_POINTS - 1U];
 }
 
 uint16_t BSP_ADC_Average(void)
@@ -631,18 +871,20 @@ uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
   uint16_t threshold;
   uint16_t low_band;
   uint16_t high_band;
-  uint16_t first_rising = 0U;
-  uint16_t last_rising = 0U;
+  uint32_t first_rising_x10 = 0U;
+  uint32_t last_rising_x10 = 0U;
   uint16_t rising_count = 0U;
   uint8_t rising_armed = 0U;
   uint8_t middle_crossed = 0U;
   uint16_t middle_crossing = 0U;
+  uint32_t middle_crossing_x10 = 0U;
   uint32_t extrema_count = 0U;
   uint32_t period_samples = 0U;
   uint32_t shape_score_sum = 0U;
   uint32_t shape_score_count = 0U;
   uint16_t large_jump_threshold;
   uint32_t large_jump_count = 0U;
+  uint64_t adc_sum = 0U;
 
   if (frame == NULL) return 0U;
   memset(frame, 0, sizeof(*frame));
@@ -667,12 +909,16 @@ uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
   for (uint16_t i = 0U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
   {
     uint16_t sample = bsp_adc_ring_sample(start_index, i);
+    adc_sum += sample;
     if (sample < minimum) minimum = sample;
     if (sample > maximum) maximum = sample;
   }
 
   frame->minimum = minimum;
   frame->maximum = maximum;
+  frame->dc_mv = (uint16_t)((adc_sum * 3300U +
+                             (BSP_ADC_CAPTURE_SAMPLE_COUNT * 4095U) / 2U) /
+                            (BSP_ADC_CAPTURE_SAMPLE_COUNT * 4095U));
   frame->vpp_mv = (uint16_t)(((uint32_t)(maximum - minimum) * 3300U +
                               2047U) / 4095U);
 
@@ -688,6 +934,9 @@ uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
   high_band = (uint16_t)(maximum - (maximum - minimum) / 8U);
   large_jump_threshold = (uint16_t)(((uint32_t)(maximum - minimum) * 2U) / 5U);
 
+  /* Ignore the short, potentially incomplete waveform portions at both DMA
+     boundaries.  Counting only the central 92% prevents a boundary crossing
+     from being paired with the next frame and distorting the frequency. */
   for (uint16_t i = 1U; i < BSP_ADC_CAPTURE_SAMPLE_COUNT; i++)
   {
     uint16_t previous = bsp_adc_ring_sample(start_index, (uint16_t)(i - 1U));
@@ -710,15 +959,30 @@ uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
         (previous < threshold) && (current >= threshold))
     {
       middle_crossing = i;
+      middle_crossing_x10 = (uint32_t)(i - 1U) * 10U;
+      if (current > previous)
+      {
+        /* Estimate the threshold crossing between two ADC samples instead
+           of rounding it to one whole sample.  At 400Hz/80kHz one sample is
+           already 0.5% of a period, so this noticeably improves accuracy. */
+        middle_crossing_x10 += ((uint32_t)(threshold - previous) * 10U) /
+                               (uint32_t)(current - previous);
+      }
       middle_crossed = 1U;
     }
     if ((rising_armed != 0U) && (current >= high_band))
     {
       if (middle_crossed != 0U)
       {
-        if (rising_count == 0U) first_rising = middle_crossing;
-        last_rising = middle_crossing;
-        rising_count++;
+        if ((middle_crossing >= BSP_ADC_VALID_MARGIN) &&
+            (middle_crossing <
+             (BSP_ADC_CAPTURE_SAMPLE_COUNT - BSP_ADC_VALID_MARGIN)))
+        {
+          if (rising_count == 0U)
+            first_rising_x10 = middle_crossing_x10;
+          last_rising_x10 = middle_crossing_x10;
+          rising_count++;
+        }
       }
       rising_armed = 0U;
       middle_crossed = 0U;
@@ -726,14 +990,17 @@ uint8_t BSP_ADC_GetScopeFrame(BspAdcScopeFrame *frame)
 
   }
 
-  if ((rising_count >= 2U) && (last_rising > first_rising))
+  if ((rising_count >= 2U) && (last_rising_x10 > first_rising_x10))
   {
-    uint32_t interval = (uint32_t)last_rising - first_rising;
+    uint32_t interval_x10 = last_rising_x10 - first_rising_x10;
     uint32_t raw_frequency_x10;
-    period_samples = (interval + (rising_count - 1U) / 2U) /
+    uint64_t cycle_count = (uint64_t)(rising_count - 1U);
+    uint64_t interval_product = (uint64_t)sample_rate * 100U * cycle_count;
+
+    period_samples = (interval_x10 + 5U) / 10U /
                      (rising_count - 1U);
-    raw_frequency_x10 = (sample_rate * 10U * (rising_count - 1U) +
-                         interval / 2U) / interval;
+    raw_frequency_x10 = (uint32_t)((interval_product + interval_x10 / 2U) /
+                                   interval_x10);
 
     uint32_t target_rate_hz = sample_rate;
 
@@ -996,8 +1263,528 @@ uint8_t BSP_Audio_InitAndStartTone(void)
 
 void BSP_Audio_Stop(void)
 {
-  if (audio_started != 0U) (void)HAL_I2S_DMAStop(&hi2s2);
+  /* Normal-mode DMA already returns the HAL handle to READY.  Only abort a
+     transfer that is genuinely still busy; aborting an already completed
+     transfer can leave the codec/I2S clock path silent for the next effect. */
+  if (HAL_I2S_GetState(&hi2s2) == HAL_I2S_STATE_BUSY_TX)
+    (void)HAL_I2S_DMAStop(&hi2s2);
   audio_started = 0U;
+}
+
+static void bsp_audio_recover_after_failure(void)
+{
+  /* Do not leave a failed DMA/I2S state latched.  The next request will
+     prepare the codec again and can therefore recover after an interrupted
+     transfer, SD read error, or a transient I2S fault. */
+  if (HAL_I2S_GetState(&hi2s2) != HAL_I2S_STATE_READY)
+    (void)HAL_I2S_DMAStop(&hi2s2);
+  audio_started = 0U;
+  audio_dma_done = 0U;
+  audio_dma_error = 0U;
+  audio_output_muted = 1U;
+  audio_codec_ready = 0U;
+}
+
+static uint16_t bsp_audio_le16(const uint8_t *data)
+{
+  return (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
+}
+
+static uint32_t bsp_audio_le32(const uint8_t *data)
+{
+  return (uint32_t)data[0] | ((uint32_t)data[1] << 8U) |
+         ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 24U);
+}
+
+static uint8_t bsp_audio_codec_prepare(void)
+{
+  if (audio_codec_ready != 0U) return 1U;
+  if (WM8978_Init() != 0U) return 0U;
+
+  WM8978_ADDA_Cfg(1U, 0U);
+  WM8978_Input_Cfg(0U, 0U, 0U);
+  WM8978_Output_Cfg(1U, 0U);
+  WM8978_I2S_Cfg(2U, 0U);       /* Philips I2S, 16-bit samples. */
+  WM8978_Write_Reg(7U, 3U << 1U); /* SR=011: codec digital filters at 16 kHz. */
+  /* Keep analogue output muted while the codec power and clocks settle. */
+  WM8978_HPvol_Set(0U, 0U);
+  WM8978_SPKvol_Set(0U);
+  osDelay(5U);
+  audio_output_muted = 1U;
+  audio_codec_ready = 1U;
+  return 1U;
+}
+
+static uint8_t bsp_audio_volume_code(void)
+{
+  uint32_t code = ((uint32_t)audio_volume_percent * 63U + 50U) / 100U;
+  if (audio_volume_percent != 0U && code == 0U) code = 1U;
+  return (uint8_t)code;
+}
+
+static void bsp_audio_apply_volume(void)
+{
+  uint8_t code = bsp_audio_volume_code();
+  WM8978_HPvol_Set(code, code);
+  WM8978_SPKvol_Set(code);
+}
+
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+  if (hi2s == &hi2s2) audio_dma_done = 1U;
+}
+
+void HAL_I2S_ErrorCallback(I2S_HandleTypeDef *hi2s)
+{
+  if (hi2s == &hi2s2) audio_dma_error = 1U;
+}
+
+static uint8_t bsp_audio_transmit_dma(uint16_t *samples, uint16_t sample_count)
+{
+  uint32_t start_tick;
+
+  audio_dma_done = 0U;
+  audio_dma_error = 0U;
+  if (HAL_I2S_Transmit_DMA(&hi2s2, samples, sample_count) != HAL_OK)
+  {
+    /* A previous short effect may have left the I2S handle busy.  Reset the
+       DMA state once and retry so every collision can start a new effect. */
+    if (HAL_I2S_GetState(&hi2s2) == HAL_I2S_STATE_BUSY_TX)
+      (void)HAL_I2S_DMAStop(&hi2s2);
+    osDelay(1U);
+    if (HAL_I2S_Transmit_DMA(&hi2s2, samples, sample_count) != HAL_OK)
+      return 0U;
+  }
+  audio_started = 1U;
+
+  /* Let the first few PCM samples reach the codec muted, then open the
+     analogue output.  This avoids the WM8978 power-up POP and preserves the
+     beginning of the voice file. */
+  if (audio_output_muted != 0U)
+  {
+    osDelay(5U);
+    bsp_audio_apply_volume();
+    audio_output_muted = 0U;
+  }
+
+  start_tick = HAL_GetTick();
+  while (audio_dma_done == 0U && audio_dma_error == 0U)
+  {
+    /* A newer game event may preempt the current effect.  With no newer
+       event this flag stays clear and the current WAV chunk plays fully. */
+    if (audio_playback_active != 0U && audio_effect_cancel != 0U)
+    {
+      if (HAL_I2S_GetState(&hi2s2) == HAL_I2S_STATE_BUSY_TX)
+        (void)HAL_I2S_DMAStop(&hi2s2);
+      audio_started = 0U;
+      return 0U;
+    }
+    if ((uint32_t)(HAL_GetTick() - start_tick) > 1000U)
+    {
+      (void)HAL_I2S_DMAStop(&hi2s2);
+      audio_started = 0U;
+      return 0U;
+    }
+    /* The DMA continues in hardware; let LVGL and other RTOS tasks run. */
+    osDelay(1U);
+  }
+
+  return (audio_dma_error == 0U) ? 1U : 0U;
+}
+
+static uint8_t bsp_audio_wait_i2s_dma(void)
+{
+  uint32_t start = HAL_GetTick();
+
+  while (HAL_I2S_GetState(&hi2s2) == HAL_I2S_STATE_BUSY_TX)
+  {
+    if ((uint32_t)(HAL_GetTick() - start) > 500U) return 0U;
+    osDelay(1U);
+  }
+  return (HAL_I2S_GetState(&hi2s2) == HAL_I2S_STATE_READY) ? 1U : 0U;
+}
+
+static uint8_t bsp_audio_wav_find_data(FIL *file, FSIZE_t *data_offset,
+                                       FSIZE_t *data_size)
+{
+  uint8_t riff_header[12];
+  uint8_t chunk_header[8];
+  uint8_t fmt_header[16];
+  UINT bytes_read;
+  FSIZE_t position = 12U;
+  FSIZE_t file_size;
+  uint8_t fmt_ok = 0U;
+
+  if (f_lseek(file, 0U) != FR_OK) return 0U;
+  if (f_read(file, riff_header, sizeof(riff_header), &bytes_read) != FR_OK ||
+      bytes_read != sizeof(riff_header)) return 0U;
+  if (memcmp(riff_header, "RIFF", 4U) != 0 ||
+      memcmp(&riff_header[8], "WAVE", 4U) != 0) return 0U;
+
+  file_size = f_size(file);
+  while ((position + 8U) <= file_size)
+  {
+    uint32_t chunk_size;
+    if (f_lseek(file, position) != FR_OK) return 0U;
+    if (f_read(file, chunk_header, sizeof(chunk_header), &bytes_read) != FR_OK ||
+        bytes_read != sizeof(chunk_header)) return 0U;
+    chunk_size = bsp_audio_le32(&chunk_header[4]);
+    position += 8U;
+
+    if (memcmp(chunk_header, "fmt ", 4U) == 0)
+    {
+      if (chunk_size < sizeof(fmt_header) ||
+          f_read(file, fmt_header, sizeof(fmt_header), &bytes_read) != FR_OK ||
+          bytes_read != sizeof(fmt_header)) return 0U;
+      /* PCM, mono, 16-bit, 16 kHz: exactly what the converted files use. */
+      fmt_ok = (uint8_t)(bsp_audio_le16(&fmt_header[0]) == 1U &&
+                         bsp_audio_le16(&fmt_header[2]) == 1U &&
+                         bsp_audio_le32(&fmt_header[4]) == 16000U &&
+                         bsp_audio_le16(&fmt_header[14]) == 16U);
+    }
+    else if (memcmp(chunk_header, "data", 4U) == 0)
+    {
+      *data_offset = position;
+      *data_size = chunk_size;
+      return (uint8_t)(fmt_ok != 0U && (*data_offset + *data_size) <= file_size);
+    }
+
+    position += (FSIZE_t)chunk_size + (chunk_size & 1U);
+  }
+  return 0U;
+}
+
+static uint8_t bsp_audio_play_file(const char *path, uint8_t hour)
+{
+  FIL file;
+  FSIZE_t data_offset;
+  FSIZE_t data_size;
+  FSIZE_t remaining;
+  UINT bytes_read;
+  uint8_t success = 0U;
+  FRESULT result;
+
+  audio_last_hour = hour;
+  audio_last_status = 0U;
+
+  if (audio_fs_mounted == 0U)
+  {
+    result = f_mount(&USERFatFS, USERPath, 1U);
+    audio_last_fresult = (uint8_t)result;
+    if (result != FR_OK)
+    {
+      audio_last_status = 1U; /* mount failed */
+      return 0U;
+    }
+    audio_fs_mounted = 1U;
+  }
+
+  result = f_open(&file, path, FA_READ);
+  audio_last_fresult = (uint8_t)result;
+  if (result != FR_OK)
+  {
+    audio_last_status = 2U; /* requested hour file not found/open failed */
+    return 0U;
+  }
+  if (bsp_audio_wav_find_data(&file, &data_offset, &data_size) == 0U)
+  {
+    (void)f_close(&file);
+    audio_last_status = 3U; /* file is not the expected 16 kHz PCM WAV */
+    return 0U;
+  }
+  if (f_lseek(&file, data_offset) != FR_OK)
+  {
+    (void)f_close(&file);
+    audio_last_status = 4U; /* data chunk seek failed */
+    return 0U;
+  }
+
+  /* Do not power up/unmute WM8978 until the SD file has been found and
+     validated. Otherwise a missing/invalid file still produces the codec's
+     one-time analogue power-up POP during every reset. */
+  if (bsp_audio_codec_prepare() == 0U)
+  {
+    (void)f_close(&file);
+    audio_last_status = 5U; /* WM8978/I2S preparation failed */
+    return 0U;
+  }
+
+  remaining = data_size;
+  while (remaining >= 2U)
+  {
+    UINT requested = (remaining > (FSIZE_t)(BSP_AUDIO_PCM_FRAMES * 2U)) ?
+                     (BSP_AUDIO_PCM_FRAMES * 2U) : (UINT)remaining;
+    result = f_read(&file, audio_wav_stereo, requested, &bytes_read);
+    audio_last_fresult = (uint8_t)result;
+    if (result != FR_OK || bytes_read < 2U)
+    {
+      audio_last_status = 6U; /* PCM data read failed */
+      break;
+    }
+
+    bytes_read &= ~1U;
+    /* Expand backwards so the mono source samples are not overwritten. */
+    for (uint32_t i = (bytes_read / 2U); i > 0U; i--)
+    {
+      uint16_t sample = audio_wav_stereo[i - 1U];
+      audio_wav_stereo[(i - 1U) * 2U] = sample;
+      audio_wav_stereo[(i - 1U) * 2U + 1U] = sample;
+    }
+    /* Send the finite PCM chunk with normal-mode DMA.  The task sleeps while
+       DMA clocks the samples out, so LVGL is not blocked by audio transfer. */
+    if (bsp_audio_transmit_dma(audio_wav_stereo,
+                               (uint16_t)((bytes_read / 2U) * 2U)) == 0U)
+    {
+      audio_last_status = 7U; /* I2S transmit failed */
+      break;
+    }
+    remaining -= bytes_read;
+  }
+
+  /* A file is successful only after every PCM byte was transmitted.  This
+     matters for recovery: a long file that fails after its first DMA chunk
+     must not be reported as a successful playback. */
+  if (remaining == 0U)
+    success = 1U;
+
+  /* Mute before stopping I2S so the final clock transition is silent. */
+  if (audio_output_muted == 0U)
+  {
+    WM8978_HPvol_Set(0U, 0U);
+    WM8978_SPKvol_Set(0U);
+    osDelay(10U);
+    audio_output_muted = 1U;
+  }
+  BSP_Audio_Stop();
+  (void)f_close(&file);
+  if (success == 0U && audio_last_status == 7U)
+    bsp_audio_recover_after_failure();
+  if (success != 0U) audio_last_status = 8U; /* playback succeeded */
+  return success;
+}
+
+uint8_t BSP_Audio_PlayHour(uint8_t hour)
+{
+  char path[20];
+
+  if (hour < 1U || hour > 24U) return 0U;
+  if (audio_voice_pack == 0U)
+    (void)snprintf(path, sizeof(path), "%s%u.wav", USERPath, hour);
+  else
+    (void)snprintf(path, sizeof(path), "%st%u.wav", USERPath, hour);
+  return bsp_audio_play_file(path, hour);
+}
+
+uint8_t BSP_Audio_PlayEffect(BspAudioEffect effect)
+{
+  const char *name = NULL;
+  const char *folder = "";
+  char path[40];
+
+  if (audio_game_music_pack != 0U)
+  {
+    static const char *const miao_star_files[5] =
+        {"xxl1.wav", "xxl2.wav", "xxl3.wav", "xxl4.wav", "xxl5.wav"};
+    static uint32_t miao_random_state = 0x61C88647UL;
+
+    folder = "/Miao/";
+    switch (effect)
+    {
+      case BSP_AUDIO_EFFECT_STAR1:
+      case BSP_AUDIO_EFFECT_STAR2:
+        miao_random_state = miao_random_state * 1664525UL +
+                            1013904223UL + HAL_GetTick();
+        name = miao_star_files[miao_random_state % 5U];
+        break;
+      case BSP_AUDIO_EFFECT_GAMEOVER: name = "xxljs.wav"; break;
+      case BSP_AUDIO_EFFECT_BOMB:     name = "xxlzd.wav"; break;
+      default: return 0U;
+    }
+  }
+  else
+  {
+    switch (effect)
+    {
+      case BSP_AUDIO_EFFECT_STAR1:    name = "xing1.wav"; break;
+      case BSP_AUDIO_EFFECT_STAR2:    name = "xing2.wav"; break;
+      case BSP_AUDIO_EFFECT_GAMEOVER: name = "shule16.wav"; break;
+      case BSP_AUDIO_EFFECT_BOMB:     name = "bbb16.wav"; break;
+      default: return 0U;
+    }
+  }
+
+  (void)snprintf(path, sizeof(path), "%s%s%s", USERPath, folder, name);
+  return bsp_audio_play_file(path, 0U);
+}
+
+void BSP_Audio_SetVoicePack(uint8_t pack)
+{
+  audio_voice_pack = (pack != 0U) ? 1U : 0U;
+}
+
+void BSP_Audio_SetGameMusicPack(uint8_t pack)
+{
+  audio_game_music_pack = (pack != 0U) ? 1U : 0U;
+}
+
+void BSP_Audio_SetVolume(uint8_t percent)
+{
+  if (percent > 100U) percent = 100U;
+  audio_volume_percent = percent;
+  if (audio_codec_ready != 0U && audio_output_muted == 0U)
+    bsp_audio_apply_volume();
+}
+
+uint8_t BSP_Audio_GetVolume(void)
+{
+  return audio_volume_percent;
+}
+
+void BSP_Audio_RequestEffect(BspAudioEffect effect)
+{
+  if ((uint32_t)effect > (uint32_t)BSP_AUDIO_EFFECT_BOMB) return;
+
+  /* Keep only the newest pending effect.  A newer event is allowed to
+     interrupt the currently playing effect immediately.  Protect the
+     multi-variable update because this function runs in the game/LVGL task
+     while the audio task consumes the request. */
+  taskENTER_CRITICAL();
+  audio_effect_queue[0U] = (uint8_t)effect;
+  audio_effect_tail = 0U;
+  audio_effect_head = 1U;
+  if (audio_playback_active != 0U) audio_effect_cancel = 1U;
+  taskEXIT_CRITICAL();
+}
+
+void BSP_Audio_RequestHour(uint8_t hour)
+{
+  if (hour < 1U || hour > 24U) return;
+  /* Hourly chimes are lower priority than game effects.  A game event can
+     preempt a chime, while a chime never preempts a game effect. */
+  taskENTER_CRITICAL();
+  audio_hour_value = hour;
+  audio_hour_pending = 1U;
+  taskEXIT_CRITICAL();
+}
+
+void BSP_Audio_ProcessPending(void)
+{
+  BspAudioEffect effect;
+  uint8_t hour;
+  uint8_t is_effect = 0U;
+  uint8_t played;
+
+  taskENTER_CRITICAL();
+  if (audio_effect_tail != audio_effect_head)
+  {
+    effect = (BspAudioEffect)audio_effect_queue[audio_effect_tail];
+    audio_effect_tail = audio_effect_head;
+    is_effect = 1U;
+  }
+  else if (audio_hour_pending != 0U)
+  {
+    hour = audio_hour_value;
+    audio_hour_pending = 0U;
+  }
+  else
+  {
+    taskEXIT_CRITICAL();
+    return;
+  }
+
+  /* Claim the job before leaving the critical section.  A request arriving
+     immediately after this point can therefore see an active playback and
+     set audio_effect_cancel without being lost. */
+  audio_effect_cancel = 0U;
+  audio_playback_active = 1U;
+  audio_effect_playing = is_effect;
+  taskEXIT_CRITICAL();
+
+  played = (is_effect != 0U) ? BSP_Audio_PlayEffect(effect) :
+                              BSP_Audio_PlayHour(hour);
+
+  taskENTER_CRITICAL();
+  audio_effect_playing = 0U;
+  audio_playback_active = 0U;
+  taskEXIT_CRITICAL();
+
+  if (is_effect == 0U || played != 0U)
+  {
+    audio_effect_retry_count = 0U;
+  }
+  else if (audio_effect_tail == audio_effect_head &&
+           audio_effect_retry_count < 2U &&
+           (audio_last_status == 1U || audio_last_status == 5U ||
+            audio_last_status == 6U || audio_last_status == 7U))
+  {
+    /* Retry only transient mount/SD/I2S errors.  A missing or invalid file
+       must not trap the default task forever and block later effects. */
+    audio_effect_queue[0U] = (uint8_t)effect;
+    audio_effect_tail = 0U;
+    audio_effect_head = 1U;
+    audio_effect_retry_count++;
+  }
+  else
+  {
+    audio_effect_retry_count = 0U;
+  }
+}
+
+uint8_t BSP_Audio_PlayTestVoice(void)
+{
+  /* File 1 is used only as a hardware-path test.  It does not depend on the
+     Time Chime switch or the RTC and therefore isolates audio/SD failures. */
+  return BSP_Audio_PlayHour(1U);
+}
+
+uint8_t BSP_Audio_GetLastFatFsResult(void)
+{
+  return audio_last_fresult;
+}
+
+uint8_t BSP_Audio_GetLastStatus(void)
+{
+  return audio_last_status;
+}
+
+uint8_t BSP_Audio_GetLastHour(void)
+{
+  return audio_last_hour;
+}
+
+void BSP_TimeChime_SetEnabled(uint8_t enabled)
+{
+  bsp_time_chime_enabled = (enabled != 0U) ? 1U : 0U;
+}
+
+uint8_t BSP_TimeChime_IsEnabled(void)
+{
+  return bsp_time_chime_enabled;
+}
+
+void BSP_TimeChime_SetTimeEditing(uint8_t editing)
+{
+  bsp_time_chime_time_editing = (editing != 0U) ? 1U : 0U;
+}
+
+uint8_t BSP_TimeChime_IsTimeEditing(void)
+{
+  return bsp_time_chime_time_editing;
+}
+
+void BSP_TimeChime_RequestAfterTimeEdit(void)
+{
+  bsp_time_chime_after_edit_pending = 1U;
+}
+
+uint8_t BSP_TimeChime_IsAfterTimeEditPending(void)
+{
+  return bsp_time_chime_after_edit_pending;
+}
+
+void BSP_TimeChime_ClearAfterTimeEdit(void)
+{
+  bsp_time_chime_after_edit_pending = 0U;
 }
 
 void BSP_Board_Init(void)
@@ -1008,6 +1795,7 @@ void BSP_Board_Init(void)
   BSP_Buzzer_Set(0U);
   BSP_Alarm_Init();
   BSP_Touch_Init();
+  BSP_GameSerial_Start();
 //  BSP_DAC_StartTestWave();
   (void)HAL_TIM_Base_Start(&htim3);
   (void)BSP_ADC_Average();

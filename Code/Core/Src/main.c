@@ -80,13 +80,21 @@ osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
   .stack_size = 1024 * 4,
-  .priority = (osPriority_t) osPriorityAboveNormal,
+  /* Audio playback is polling-based; keep it below LVGL so the clock and
+     display continue refreshing while a voice file is being sent. */
+  .priority = (osPriority_t) osPriorityBelowNormal,
 };
 osThreadId_t lvglTaskHandle;
 const osThreadAttr_t lvglTask_attributes = {
   .name = "lvglTask",
   .stack_size = 1024 * 8,
   .priority = (osPriority_t) osPriorityNormal,
+};
+osThreadId_t audioTaskHandle;
+const osThreadAttr_t audioTask_attributes = {
+  .name = "audioTask",
+  .stack_size = 1024 * 3,
+  .priority = (osPriority_t) osPriorityAboveNormal,
 };
 /* USER CODE BEGIN PV */
 
@@ -107,6 +115,7 @@ static void MX_I2S2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
+void StartAudioTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -212,6 +221,7 @@ int main(void)
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
   lvglTaskHandle = osThreadNew(BSP_LVGL_Task, NULL, &lvglTask_attributes);
+  audioTaskHandle = osThreadNew(StartAudioTask, NULL, &audioTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -513,17 +523,18 @@ static void MX_SDIO_SD_Init(void)
   hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd.Init.ClockDiv = 0;
+  /* Start SDIO at a conservative 12 MHz. This improves read reliability on
+     long board traces and allows FatFs to mount before any audio playback. */
+  hsd.Init.ClockDiv = 2;
   if (HAL_SD_Init(&hsd) != HAL_OK)
   {
     /* SD card is optional during board bring-up.  Do not prevent LCD and
        other drivers from starting when no card is inserted or detected. */
     return;
   }
-  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
-  {
-    return;
-  }
+  /* Keep the card in 1-bit mode for the first reliable FatFs/audio path.
+     The audio stream is far below the 1-bit SDIO bandwidth, while this avoids
+     read failures caused by a marginal D1-D3 connection or pull-up network. */
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */
@@ -879,6 +890,10 @@ void StartDefaultTask(void *argument)
   uint32_t blink = 0U;
   uint8_t led_state = 0U;
   uint8_t sd_tested = 0U;
+  uint32_t last_led_tick = 0U;
+  uint32_t last_time_chime_key = 0xFFFFFFFFU;
+  RTC_TimeTypeDef chime_time = {0};
+  RTC_DateTypeDef chime_date = {0};
   /* UART self-test logging is intentionally disabled here.  The polling
      transmit can block a task when the debug UART is not available. */
   // BSP_Log("\r\n[SELFTEST] SmartClock driver test started\r\n");
@@ -887,10 +902,54 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    uint32_t task_now = HAL_GetTick();
+
+    /* USART2 responses are serviced from the always-running default task,
+       independent of LVGL rendering or page changes. */
+    BSP_GameSerial_Service();
     /* Scheduler/LCD coexistence indicator: the two LEDs alternate every 500 ms. */
-    led_state = (uint8_t)!led_state;
-    BSP_LED_Set(0U, led_state);
-    BSP_LED_Set(1U, (uint8_t)!led_state);
+    if ((uint32_t)(task_now - last_led_tick) >= 500U)
+    {
+      last_led_tick = task_now;
+      led_state = (uint8_t)!led_state;
+      BSP_LED_Set(0U, led_state);
+      BSP_LED_Set(1U, (uint8_t)!led_state);
+    }
+
+    /* The 24 converted voice files are mapped to hours 1..24; midnight
+       uses 24.wav.  Mark the hour before playback so a slow SD/audio path
+       cannot trigger the same chime twice. */
+    (void)HAL_RTC_GetTime(&hrtc, &chime_time, RTC_FORMAT_BIN);
+    (void)HAL_RTC_GetDate(&hrtc, &chime_date, RTC_FORMAT_BIN);
+    {
+      uint32_t chime_key = ((uint32_t)chime_date.Year * 13U +
+                            chime_date.Month) * 32U + chime_date.Date;
+      chime_key = chime_key * 24U + chime_time.Hours;
+      /* Give the 500 ms task a generous first-30-second window after the
+         minute changes. The key prevents duplicate playback in that window. */
+      /* A time edit must not turn an arbitrary time such as 01:59:54
+         into a chime. Only the real hourly window is allowed to play.
+         Discard a pending post-edit request outside that window. */
+      uint8_t in_hour_chime_window =
+          (chime_time.Minutes == 0U && chime_time.Seconds < 5U) ? 1U : 0U;
+      if (BSP_TimeChime_IsAfterTimeEditPending() != 0U &&
+          in_hour_chime_window == 0U)
+      {
+        BSP_TimeChime_ClearAfterTimeEdit();
+      }
+      if (BSP_TimeChime_IsEnabled() != 0U &&
+          BSP_TimeChime_IsTimeEditing() == 0U &&
+          in_hour_chime_window != 0U &&
+          chime_key != last_time_chime_key)
+      {
+        uint8_t voice_hour = (chime_time.Hours == 0U) ? 24U : chime_time.Hours;
+        /* Submit the chime to the dedicated audio task.  The default task
+           must never block on SD/I2S playback. */
+        BSP_Audio_RequestHour(voice_hour);
+        last_time_chime_key = chime_key;
+        BSP_TimeChime_ClearAfterTimeEdit();
+      }
+    }
 
     if ((blink % 100U) == 0U)
     {
@@ -913,9 +972,20 @@ void StartDefaultTask(void *argument)
     (void)sd_tested;
 
     blink++;
-    osDelay(500U);
-  }
+    /* Keep serial ACKs, queued game effects and the LED scheduler responsive. */
+    osDelay(5U);
+}
   /* USER CODE END 5 */
+}
+
+void StartAudioTask(void *argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    BSP_Audio_ProcessPending();
+    osDelay(1U);
+  }
 }
 
 /**
